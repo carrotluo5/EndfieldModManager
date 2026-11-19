@@ -1,0 +1,36 @@
+{
+  "name": "endfield-mod-manager",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@tauri-apps/api": "^2.4.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.2.0",
+    "lucide-react": "^0.511.0",
+    "motion": "^12.12.1",
+    "pinyin-pro": "^3.28.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-easy-crop": "^5.5.6",
+    "zustand": "^5.0.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.5",
+    "@tauri-apps/cli": "^2.4.0",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "tailwindcss": "^4.1.5",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
