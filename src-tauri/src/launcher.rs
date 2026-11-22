@@ -313,11 +313,158 @@ pub fn ensure_keypress_bridge(cfg: &AppConfig) -> Result<(), String> {
     crate::persist_bridge::ensure_keypress_files(&efmi_root)
 }
 
+fn split_launch_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_token {
+                    args.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            '\\' if in_quotes => {
+                // Only unescape `\"` inside quotes so Windows paths like C:\Mods\ keep backslashes.
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    current.push('\\');
+                }
+                has_token = true;
+            }
+            c => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+fn format_shell_execute_params(args: &[String]) -> String {
+    let mut out = String::new();
+    for (idx, arg) in args.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let needs_quotes =
+            arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t' | '"'));
+        if !needs_quotes {
+            out.push_str(arg);
+            continue;
+        }
+        out.push('"');
+        let mut backslashes = 0usize;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => {
+                    backslashes += 1;
+                    out.push('\\');
+                }
+                '"' => {
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    out.push_str("\\\"");
+                    backslashes = 0;
+                }
+                _ => {
+                    backslashes = 0;
+                    out.push(ch);
+                }
+            }
+        }
+        for _ in 0..backslashes {
+            out.push('\\');
+        }
+        out.push('"');
+    }
+    out
+}
+
+#[cfg(windows)]
+fn launch_via_shell_execute_elevated(
+    exe: &Path,
+    work_dir: &Path,
+    args: &[String],
+    label: &str,
+) -> Result<(), String> {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb = HSTRING::from("runas");
+    let file = HSTRING::from(exe.as_os_str());
+    let dir = HSTRING::from(work_dir.as_os_str());
+    let params_str = format_shell_execute_params(args);
+
+    let hinst = if params_str.is_empty() {
+        unsafe { ShellExecuteW(None, &verb, &file, None, &dir, SW_SHOWNORMAL) }
+    } else {
+        let params = HSTRING::from(params_str);
+        unsafe { ShellExecuteW(None, &verb, &file, &params, &dir, SW_SHOWNORMAL) }
+    };
+
+    let code = hinst.0 as usize;
+    if code <= 32 {
+        if code == 5 {
+            return Err(format!(
+                "启动 {label} 需要管理员权限，但 UAC 提权请求被取消或拒绝"
+            ));
+        }
+        return Err(format!(
+            "启动 {label} 失败（UAC 提权拉起返回错误码 {code}）"
+        ));
+    }
+    Ok(())
+}
+
+fn spawn_executable(
+    exe: &Path,
+    work_dir: &Path,
+    args: &[String],
+    hide_console: bool,
+    label: &str,
+) -> Result<(), String> {
+    let mut cmd = Command::new(exe);
+    cmd.current_dir(work_dir).args(args);
+    #[cfg(windows)]
+    if hide_console {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = hide_console;
+
+    match cmd.spawn() {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // Standard CreateProcess returns ERROR_ELEVATION_REQUIRED (740) when target needs UAC.
+            #[cfg(windows)]
+            if err.raw_os_error() == Some(740) {
+                return launch_via_shell_execute_elevated(exe, work_dir, args, label);
+            }
+            Err(format!("启动 {label} 失败：{err}"))
+        }
+    }
+}
+
 pub fn launch_game(cfg: &AppConfig, mode_override: Option<&str>) -> Result<(), String> {
     let mode = mode_override.unwrap_or(&cfg.launch_mode);
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let extra = cfg.launch_args.trim();
+    let extra_args = split_launch_args(&cfg.launch_args);
 
     match mode {
         "EFMI" | "XXMI" => {
@@ -327,21 +474,14 @@ pub fn launch_game(cfg: &AppConfig, mode_override: Option<&str>) -> Result<(), S
             }
             let _ = ensure_keypress_bridge(cfg);
             let work_dir = exe.parent().unwrap_or_else(|| Path::new("."));
-            let mut cmd = Command::new(exe);
-            cmd.current_dir(work_dir);
+            let mut args = Vec::new();
             if mode == "EFMI" {
-                cmd.args(["--nogui", "--xxmi", "EFMI"]);
+                args.push("--nogui".to_string());
+                args.push("--xxmi".to_string());
+                args.push("EFMI".to_string());
             }
-            if !extra.is_empty() {
-                for arg in extra.split_whitespace() {
-                    cmd.arg(arg);
-                }
-            }
-            #[cfg(windows)]
-            cmd.creation_flags(CREATE_NO_WINDOW);
-            cmd.spawn()
-                .map_err(|e| format!("启动 XXMI 启动器失败：{e}"))?;
-            Ok(())
+            args.extend(extra_args);
+            spawn_executable(exe, work_dir, &args, true, "XXMI 启动器")
         }
         "VANILLA" => {
             let exe = Path::new(&cfg.game_path);
@@ -349,16 +489,44 @@ pub fn launch_game(cfg: &AppConfig, mode_override: Option<&str>) -> Result<(), S
                 return Err("未找到有效的 Endfield.exe，请先在系统设置中配置游戏路径".to_string());
             }
             let work_dir = exe.parent().unwrap_or_else(|| Path::new("."));
-            let mut cmd = Command::new(exe);
-            cmd.current_dir(work_dir);
-            if !extra.is_empty() {
-                for arg in extra.split_whitespace() {
-                    cmd.arg(arg);
-                }
-            }
-            cmd.spawn().map_err(|e| format!("启动游戏失败：{e}"))?;
-            Ok(())
+            spawn_executable(exe, work_dir, &extra_args, false, "游戏")
         }
         other => Err(format!("不支持的启动模式：{other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_launch_args_and_shell_execute_quoting() {
+        let parsed = split_launch_args(r#"-popupwindow --config "C:\Program Files\EFMI\cfg.json" --note="hello world""#);
+        assert_eq!(
+            parsed,
+            vec![
+                "-popupwindow",
+                "--config",
+                r"C:\Program Files\EFMI\cfg.json",
+                "--note=hello world",
+            ]
+        );
+
+        let efmi_args = vec![
+            "--nogui".to_string(),
+            "--xxmi".to_string(),
+            "EFMI".to_string(),
+        ];
+        assert_eq!(format_shell_execute_params(&efmi_args), "--nogui --xxmi EFMI");
+
+        let special_args = vec![
+            r"C:\My Mods\".to_string(),
+            r#"say "hi""#.to_string(),
+            "".to_string(),
+        ];
+        assert_eq!(
+            format_shell_execute_params(&special_args),
+            r#""C:\My Mods\\" "say \"hi\"" """#
+        );
     }
 }
