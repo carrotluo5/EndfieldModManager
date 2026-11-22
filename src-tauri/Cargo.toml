@@ -1,6 +1,6 @@
 [package]
 name = "endfield-mod-manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "明日方舟：终末地（EFMI / XXMI）Windows 本地 Mod 管理工具"
 authors = ["carrotluo5"]
 edition = "2021"
