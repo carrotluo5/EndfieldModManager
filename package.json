@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "node scripts/build-release.mjs --portable-only",
+    "build:frontend": "tsc && vite build",
+    "build:release": "node scripts/build-release.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

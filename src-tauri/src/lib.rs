@@ -13,6 +13,7 @@ pub mod persist_bridge;
 pub mod presets;
 pub mod organizer;
 pub mod undo;
+pub mod updater;
 pub mod win_input;
 
 use crate::models::{
@@ -21,8 +22,8 @@ use crate::models::{
     GameRuntimeStatus, ImportAnalysisResponse, ImportExecutionSummary, ImportPlanItem, ModDetails,
     ModListResponse, ModPreset, OrganizeApplyResult, OrganizeScanReport, OverlayStateSnapshot,
     PackageUpdateResult, PersistBridgeStatus, PresetImportResult, PresetListResponse,
-    PresetModEntry, QaqmImportSummary, RabbitFxStatus, TagsPoolStore, ToggleModResult,
-    UndoEntrySummary, UndoResult, XxmiConsistency,
+    PresetModEntry, RabbitFxStatus, TagsPoolStore, ToggleModResult, UndoEntrySummary, UndoResult,
+    UpdateCheckResult, XxmiConsistency,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -31,12 +32,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::utils::config::{AppDirectoriesOverride, AppDirectoryOverrides};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub undo_stack: Mutex<undo::UndoStack>,
     pub overlay: Mutex<overlay::OverlayRuntimeState>,
+    pub overlay_window_build: Mutex<()>,
     pub import_sessions: importer::ImportSessionStore,
     pub is_quitting: AtomicBool,
 }
@@ -71,22 +74,6 @@ fn update_config(
 }
 
 #[tauri::command]
-fn import_from_qaqmanager(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<QaqmImportSummary, String> {
-    let summary = config::import_from_default_qaqmanager()?;
-    let reloaded = config::load_config()?;
-    {
-        let mut guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
-        *guard = reloaded.clone();
-    }
-    let _ = app.emit("settings-changed", &reloaded);
-    let _ = app.emit("characters-changed", ());
-    Ok(summary)
-}
-
-#[tauri::command]
 fn get_preset_count() -> Result<usize, String> {
     let store = config::load_presets()?;
     Ok(store.presets.len())
@@ -109,9 +96,23 @@ fn auto_detect_paths(state: State<'_, AppState>) -> Result<AutoDetectedPaths, St
 }
 
 #[tauri::command]
-fn check_xxmi_consistency(state: State<'_, AppState>) -> Result<XxmiConsistency, String> {
-    let guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
-    Ok(launcher::check_xxmi_consistency(&guard))
+fn check_xxmi_consistency(
+    state: State<'_, AppState>,
+    mods_path: Option<String>,
+    xxmi_path: Option<String>,
+) -> Result<XxmiConsistency, String> {
+    let mut cfg = state.config.lock().map_err(|_| "配置锁异常".to_string())?.clone();
+    if let Some(path) = mods_path {
+        let path = path.trim();
+        if path.is_empty() || !Path::new(path).is_dir() {
+            return Err("请选择已存在的 EFMI Mods 文件夹".to_string());
+        }
+        cfg.mods_path = path.to_string();
+    }
+    if let Some(path) = xxmi_path {
+        cfg.xxmi_path = path.trim().to_string();
+    }
+    Ok(launcher::check_xxmi_consistency(&cfg))
 }
 
 #[tauri::command]
@@ -126,9 +127,12 @@ fn open_path_in_explorer(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn list_characters(state: State<'_, AppState>) -> Result<Vec<CharacterItem>, String> {
+fn list_characters(
+    state: State<'_, AppState>,
+    include_all: Option<bool>,
+) -> Result<Vec<CharacterItem>, String> {
     let guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
-    characters::list_characters(&guard)
+    characters::list_characters(&guard, include_all)
 }
 
 #[tauri::command]
@@ -556,12 +560,13 @@ fn set_persist_bridge_enabled(
     enabled: bool,
 ) -> Result<PersistBridgeStatus, String> {
     let mut guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
+    let mut next_cfg = guard.clone();
     let status = if enabled {
-        persist_bridge::sync_all_enabled_mods(&mut guard)?
+        persist_bridge::sync_all_enabled_mods(&mut next_cfg)?
     } else {
-        persist_bridge::disable_and_restore_all(&mut guard)?
+        persist_bridge::disable_and_restore_all(&mut next_cfg)?
     };
-    let next_cfg = guard.clone();
+    *guard = next_cfg.clone();
     drop(guard);
     let _ = app.emit("settings-changed", &next_cfg);
     let _ = app.emit("mods-changed", "");
@@ -575,16 +580,17 @@ fn set_persist_bridge_cache_size(
     cache_size: u32,
 ) -> Result<PersistBridgeStatus, String> {
     let mut guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
-    guard.persist_bridge_cache_size = cache_size.min(30);
-    let max_recent = guard.persist_bridge_cache_size as usize;
-    guard.persist_bridge_recent.truncate(max_recent);
-    let status = if guard.persist_bridge_enabled {
-        persist_bridge::sync_all_enabled_mods(&mut guard)?
+    let mut next_cfg = guard.clone();
+    next_cfg.persist_bridge_cache_size = cache_size.min(30);
+    let max_recent = next_cfg.persist_bridge_cache_size as usize;
+    next_cfg.persist_bridge_recent.truncate(max_recent);
+    let status = if next_cfg.persist_bridge_enabled {
+        persist_bridge::sync_all_enabled_mods(&mut next_cfg)?
     } else {
-        config::save_config(&guard)?;
-        persist_bridge::get_status(&guard)
+        config::save_config(&next_cfg)?;
+        persist_bridge::get_status(&next_cfg)
     };
-    let next_cfg = guard.clone();
+    *guard = next_cfg.clone();
     drop(guard);
     let _ = app.emit("settings-changed", &next_cfg);
     Ok(status)
@@ -774,7 +780,7 @@ fn get_overlay_state(app: AppHandle) -> OverlayStateSnapshot {
 }
 
 #[tauri::command]
-fn show_overlay(app: AppHandle) -> Result<(), String> {
+async fn show_overlay(app: AppHandle) -> Result<(), String> {
     overlay::show_overlay(&app)
 }
 
@@ -784,7 +790,7 @@ fn hide_overlay(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn toggle_overlay(app: AppHandle) -> Result<bool, String> {
+async fn toggle_overlay(app: AppHandle) -> Result<bool, String> {
     overlay::toggle_overlay(&app)
 }
 
@@ -800,25 +806,16 @@ fn set_overlay_scale(app: AppHandle, scale: f64) -> Result<AppConfig, String> {
 
 #[tauri::command]
 async fn set_overlay_hotkey(app: AppHandle, hotkey: String) -> Result<AppConfig, String> {
-    let clean = hotkey.trim().to_string();
-    if clean.is_empty() {
-        return Err("局内呼出热键不能为空".to_string());
-    }
-    overlay::register_overlay_hotkey(&app, &clean)?;
-    let next_cfg = {
-        let state = app.state::<AppState>();
-        let mut guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
-        guard.overlay_hotkey = clean;
-        config::save_config(&guard)?;
-        guard.clone()
-    };
-    let _ = app.emit("settings-changed", &next_cfg);
-    overlay::emit_overlay_state(&app);
-    Ok(next_cfg)
+    overlay::set_overlay_hotkey(&app, &hotkey)
 }
 
 #[tauri::command]
-fn open_overlay_side_panel(
+fn get_overlay_hotkey_registered(app: AppHandle) -> bool {
+    overlay::configured_hotkey_is_registered(&app)
+}
+
+#[tauri::command]
+async fn open_overlay_side_panel(
     app: AppHandle,
     mode: String,
     character_name: Option<String>,
@@ -869,22 +866,64 @@ async fn execute_import_plan(
     session_id: String,
     plans: Vec<ImportPlanItem>,
 ) -> Result<ImportExecutionSummary, String> {
-    let mut cfg = {
+    let mut import_cfg = {
         let guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
         guard.clone()
     };
-    let summary =
-        importer::execute_import_plan(&mut cfg, &state.import_sessions, &session_id, plans)?;
-    {
-        let mut guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
-        guard.mod_added_at = cfg.mod_added_at;
-        guard.persist_bridge_recent = cfg.persist_bridge_recent;
+    // This map is an output of installation used to merge only the new entries.
+    import_cfg.mod_added_at.clear();
+    let initial_recent = import_cfg.persist_bridge_recent.clone();
+    let mut summary =
+        importer::execute_import_plan(&mut import_cfg, &state.import_sessions, &session_id, plans)?;
+    if summary.installed_count == 0 {
+        return Ok(summary);
     }
-    if summary.installed_count > 0 {
-        let _ = app.emit("characters-changed", ());
-        let _ = app.emit("mods-changed", "");
+
+    let warning = {
+        let mut latest = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
+        if latest.mods_path == import_cfg.mods_path {
+            merge_import_config_changes(&mut latest, import_cfg, &initial_recent);
+            config::save_config(&latest)
+                .err()
+                .map(|error| format!("已安装，保存管理器配置失败：{error}"))
+        } else {
+            Some(format!("已安装到导入开始时的 Mods 目录：{}", import_cfg.mods_path))
+        }
+    };
+
+    if let Some(warning) = warning {
+        for result in &mut summary.results {
+            if result.message == importer::INSTALLED_MESSAGE {
+                result.message.clone_from(&warning);
+            }
+        }
     }
+    let _ = app.emit("characters-changed", ());
+    let _ = app.emit("mods-changed", "");
     Ok(summary)
+}
+
+fn merge_import_config_changes(
+    latest: &mut AppConfig,
+    imported: AppConfig,
+    initial_recent: &[String],
+) {
+    for (name, added_at) in imported.mod_added_at {
+        latest.mod_added_at.entry(name)
+            .and_modify(|existing| *existing = (*existing).max(added_at))
+            .or_insert(added_at);
+    }
+    if latest.persist_bridge_enabled && imported.persist_bridge_enabled {
+        let reactivated: Vec<_> = initial_recent
+            .iter()
+            .filter(|entry| {
+                !imported.persist_bridge_recent.iter().any(|left| left.eq_ignore_ascii_case(entry))
+            })
+            .collect();
+        latest.persist_bridge_recent.retain(|entry| {
+            !reactivated.iter().any(|used| used.eq_ignore_ascii_case(entry))
+        });
+    }
 }
 
 #[tauri::command]
@@ -1089,6 +1128,45 @@ fn minimize_to_tray(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_app_version() -> String {
+    updater::CURRENT_VERSION.to_string()
+}
+
+#[tauri::command]
+async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheckResult, String> {
+    let cfg = {
+        let guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || updater::check_for_updates(&cfg))
+        .await
+        .map_err(|e| format!("检查更新任务异常：{e}"))?
+}
+
+#[tauri::command]
+async fn download_and_apply_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    download_url: String,
+    expected_sha256: Option<String>,
+) -> Result<(), String> {
+    let cfg = {
+        let guard = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        updater::download_and_apply_update(&app, &cfg, &download_url, expected_sha256.as_deref())
+    })
+    .await
+    .map_err(|e| format!("更新安装任务异常：{e}"))?
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    updater::open_external_url(&url)
+}
+
+#[tauri::command]
 fn quit_app(app: AppHandle, state: State<'_, AppState>) {
     state.is_quitting.store(true, Ordering::SeqCst);
     let _ = overlay::hide_overlay(&app);
@@ -1120,7 +1198,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "toggle_overlay" => {
-                let _ = overlay::toggle_overlay(app);
+                overlay::toggle_overlay_in_background(app.clone());
             }
             "quit" => {
                 let state = app.state::<AppState>();
@@ -1154,8 +1232,23 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    updater::cleanup_stale_old_exe();
     let initial_config = config::load_config().unwrap_or_default();
     let initial_hotkey = initial_config.overlay_hotkey.clone();
+    let mut context = tauri::generate_context!();
+    if let Some(data_dir) = config::custom_app_data_dir() {
+        let profile = data_dir.join("webview");
+        let profile = std::path::absolute(&profile)
+            .unwrap_or_else(|err| panic!("无法解析 WebView 数据目录 {}：{err}", profile.display()));
+        std::fs::create_dir_all(&profile)
+            .unwrap_or_else(|err| panic!("无法创建 WebView 数据目录 {}：{err}", profile.display()));
+        context.config_mut().app.app_directories_override = Some(
+            AppDirectoriesOverride::Directories(AppDirectoryOverrides {
+                local_data: Some(profile),
+                ..Default::default()
+            }),
+        );
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1171,6 +1264,7 @@ pub fn run() {
             config: Mutex::new(initial_config),
             undo_stack: Mutex::new(undo::UndoStack::default()),
             overlay: Mutex::new(overlay::OverlayRuntimeState::default()),
+            overlay_window_build: Mutex::new(()),
             import_sessions: importer::ImportSessionStore::default(),
             is_quitting: AtomicBool::new(false),
         })
@@ -1182,7 +1276,9 @@ pub fn run() {
             let handle = app.handle().clone();
             let hk = initial_hotkey.clone();
             std::thread::spawn(move || {
-                let _ = overlay::register_overlay_hotkey(&handle, &hk);
+                if let Err(err) = overlay::register_overlay_hotkey(&handle, &hk) {
+                    eprintln!("{err}");
+                }
             });
             Ok(())
         })
@@ -1206,8 +1302,10 @@ pub fn run() {
                             let _ = window.hide();
                         }
                         "quit" => {
+                            api.prevent_close();
                             state.is_quitting.store(true, Ordering::SeqCst);
                             let _ = overlay::hide_overlay(app);
+                            app.exit(0);
                         }
                         _ => {
                             api.prevent_close();
@@ -1234,7 +1332,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             update_config,
-            import_from_qaqmanager,
             get_preset_count,
             get_tags_pool,
             save_tags_pool,
@@ -1297,6 +1394,7 @@ pub fn run() {
             set_overlay_pinned,
             set_overlay_scale,
             set_overlay_hotkey,
+            get_overlay_hotkey_registered,
             open_overlay_side_panel,
             adjust_overlay_side_width,
             select_overlay_character,
@@ -1318,10 +1416,14 @@ pub fn run() {
             set_autostart_enabled,
             export_config_file,
             import_config_file,
+            get_app_version,
+            check_for_updates,
+            download_and_apply_update,
+            open_external_url,
             minimize_to_tray,
             quit_app,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running EndfieldModManager");
 }
 
@@ -1339,6 +1441,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("efmm_test_{label}_{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_import_config_merge_preserves_newer_settings_and_cache_entries() {
+        let mut latest = AppConfig {
+            custom_accent: "#123456".to_string(),
+            persist_bridge_enabled: true,
+            mod_added_at: HashMap::from([
+                ("佩丽卡/Other Skin".to_string(), 40),
+                ("伊冯/Reinstalled Skin".to_string(), 50),
+            ]),
+            persist_bridge_recent: vec!["new.ini".to_string(), "old.ini".to_string()],
+            ..AppConfig::default()
+        };
+        let imported = AppConfig {
+            persist_bridge_enabled: true,
+            mod_added_at: HashMap::from([
+                ("佩丽卡/Imported Skin".to_string(), 30),
+                ("伊冯/Reinstalled Skin".to_string(), 30),
+            ]),
+            ..AppConfig::default()
+        };
+
+        merge_import_config_changes(&mut latest, imported, &["OLD.INI".to_string()]);
+
+        assert_eq!(latest.custom_accent, "#123456");
+        assert_eq!(latest.mod_added_at["佩丽卡/Other Skin"], 40);
+        assert_eq!(latest.mod_added_at["伊冯/Reinstalled Skin"], 50);
+        assert_eq!(latest.mod_added_at["佩丽卡/Imported Skin"], 30);
+        assert_eq!(latest.persist_bridge_recent, ["new.ini"]);
     }
 
     #[test]
@@ -1505,7 +1637,7 @@ hash = 1234ABCD
         cfg.show_all_characters = false;
 
         let t0 = std::time::Instant::now();
-        let chars = characters::list_characters(&cfg).unwrap();
+        let chars = characters::list_characters(&cfg, None).unwrap();
         assert!(!chars.is_empty());
 
         let rfx = ini_engine::get_rabbitfx_status(real_mods);
@@ -1523,10 +1655,12 @@ hash = 1234ABCD
     fn test_hotkey_ini_writeback_and_backup_sync() {
         let mod_dir = make_temp_dir("hotkey_wb");
         let ini_path = mod_dir.join("mod.ini");
-        let bak_path = mod_dir.join("mod.ini.qaqm-persistbak");
+        let bak_path = persist_bridge::backup_path(&ini_path);
+        let legacy_bak_path = mod_dir.join("mod.ini.qaqm-persistbak");
         let orig = "[Constants]\r\nglobal $mode = 0\r\n[KeySwitch]\r\nkey = alt k ; comment kept\r\n$mode = 0, 1\r\n";
         fs::write(&ini_path, orig).unwrap();
         fs::write(&bak_path, orig).unwrap();
+        fs::write(&legacy_bak_path, orig).unwrap();
 
         ini_engine::update_hotkey_in_ini(&mod_dir, "mod.ini", "KeySwitch", "Ctrl Shift VK_J").unwrap();
 
@@ -1535,6 +1669,7 @@ hash = 1234ABCD
         assert!(new_ini.contains("key = Ctrl Shift VK_J ; comment kept"));
         assert!(new_bak.contains("key = Ctrl Shift VK_J ; comment kept"));
         assert!(new_ini.contains("\r\n"));
+        assert_eq!(fs::read_to_string(&legacy_bak_path).unwrap(), orig);
 
         let parsed = ini_engine::parse_hotkeys_for_mod(&mod_dir, &[ini_path], &HashMap::new());
         assert_eq!(parsed.len(), 1);
@@ -1594,46 +1729,29 @@ hash = 1234ABCD
             )
             .unwrap()
             .unwrap();
-            assert_eq!(state_file, format!("qaqm_state_{hash12}.ini"));
+            assert_eq!(state_file, format!("efmm_state_{hash12}.ini"));
 
             persist_bridge::write_bridge_includers(&efmi_root, &[state_file.clone()]).unwrap();
 
             let rewritten = fs::read_to_string(&mod_ini).unwrap();
-            assert!(rewritten.contains(&format!("$\\QAQM\\Persist\\Bridge_{hash12}\\swap")));
-            assert!(rewritten.contains(&format!("$\\QAQM\\Persist\\Bridge_{hash12}\\swap_extra")));
-            assert!(mod_dir.join("mod.ini.qaqm-persistbak").is_file());
+            assert!(rewritten.contains(&format!("$\\EFMM\\Persist\\Bridge_{hash12}\\swap")));
+            assert!(rewritten.contains(&format!("$\\EFMM\\Persist\\Bridge_{hash12}\\swap_extra")));
+            assert!(persist_bridge::backup_path(&mod_ini).is_file());
 
             // Simulate user toggling in game -> d3dx_user.ini updated
             fs::write(
                 efmi_root.join("d3dx_user.ini"),
-                format!("[Constants]\r\n$\\qaqm\\persist\\bridge_{hash12}\\swap = 1\r\n"),
+                format!("[Constants]\r\n$\\efmm\\persist\\bridge_{hash12}\\swap = 1\r\n"),
             )
             .unwrap();
 
             cfg.persist_bridge_enabled = true;
             persist_bridge::on_mod_disabled(&mut cfg, &mod_dir);
             let cached_state =
-                fs::read_to_string(efmi_root.join("qaqm").join("cache").join(&state_file)).unwrap();
+                fs::read_to_string(efmi_root.join(persist_bridge::BRIDGE_DIR).join("cache").join(&state_file)).unwrap();
             assert!(cached_state.contains("global persist $swap = 1"));
 
-            // Restore backups cleanly (simulate disabling bridge)
-            let backups: Vec<_> = walkdir::WalkDir::new(&mods_root)
-                .into_iter()
-                .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .ends_with(".ini.qaqm-persistbak")
-                })
-                .map(|e| e.into_path())
-                .collect();
-            for bak in backups {
-                let fname = bak.file_name().unwrap().to_str().unwrap();
-                let orig = bak.with_file_name(&fname[..fname.len() - ".qaqm-persistbak".len()]);
-                fs::write(&orig, fs::read(&bak).unwrap()).unwrap();
-                fs::remove_file(&bak).unwrap();
-            }
+            persist_bridge::disable_and_restore_all(&mut cfg).unwrap();
 
             assert_eq!(fs::read(&mod_ini).unwrap(), original_ini.as_bytes(), "cycle {cycle}");
             assert_eq!(
@@ -1645,8 +1763,111 @@ hash = 1234ABCD
 
         // Verify d3dx.ini only contains single mount even after 10 calls
         let d3dx = fs::read_to_string(efmi_root.join("d3dx.ini")).unwrap();
-        assert_eq!(d3dx.matches("qaqm_includer.ini").count(), 1);
+        assert_eq!(d3dx.matches(persist_bridge::BRIDGE_INCLUDE).count(), 1);
 
+        let _ = fs::remove_dir_all(efmi_root);
+    }
+
+    #[test]
+    fn test_independent_persist_bridge_preserves_legacy_files_and_user_variables() {
+        let efmi_root = make_temp_dir("pb_independent");
+        let mods_root = efmi_root.join("Mods");
+        let mod_dir = mods_root.join("佩丽卡").join("试装");
+        let legacy_dir = efmi_root.join("qaqm");
+        fs::create_dir_all(&mod_dir).unwrap();
+        fs::create_dir_all(legacy_dir.join("cache")).unwrap();
+        let ini = mod_dir.join("mod.ini");
+        let external_backup = ini.with_file_name("mod.ini.qaqm-persistbak");
+        let original_ini = "namespace = Example\\Native\r\n[Constants]\r\nglobal persist $state = 2\r\n";
+        fs::write(&ini, original_ini).unwrap();
+        let d3dx = efmi_root.join("d3dx.ini");
+        fs::write(&d3dx, b"\xef\xbb\xbf[Include] ; options\r\ninclude = qaqm\\qaqm_includer.ini\r\n; stock \xa1\xaa\r\n").unwrap();
+        let old_includer = legacy_dir.join("qaqm_includer.ini");
+        let keypress_only = "[IncludeKeypress]\r\ninclude = qaqm_keypress.ini\r\n";
+        fs::write(&old_includer, keypress_only).unwrap();
+        let old_active = legacy_dir.join("qaqm_persist_active.ini");
+        fs::write(&old_active, "[IncludePersistState]\r\ninclude = cache\\qaqm_state_123456abcdef.ini\r\n").unwrap();
+        let old_cache = legacy_dir.join("cache").join("qaqm_state_123456abcdef.ini");
+        fs::write(&old_cache, b"old state").unwrap();
+        let mut cfg = AppConfig {
+            mods_path: mods_root.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+
+        // An active legacy state manifest stops enabling before any EFMM write.
+        let mounted = format!("{keypress_only}\r\n[IncludePersist]\r\ninclude = qaqm_persist_active.ini\r\n");
+        fs::write(&old_includer, &mounted).unwrap();
+        let d3dx_orig = fs::read(&d3dx).unwrap();
+        assert!(persist_bridge::sync_all_enabled_mods(&mut cfg).is_err());
+        assert!(!efmi_root.join(persist_bridge::BRIDGE_DIR).exists());
+        assert_eq!(fs::read(&d3dx).unwrap(), d3dx_orig);
+        assert!(!cfg.persist_bridge_enabled);
+        assert!(persist_bridge::get_status(&cfg).legacy_conflict);
+
+        // The persisted enabled flag from a previous version must not activate EFMM implicitly.
+        cfg.persist_bridge_enabled = true;
+        persist_bridge::on_mod_enabled(&mut cfg, &mod_dir);
+        persist_bridge::on_mod_disabled(&mut cfg, &mod_dir);
+        assert!(!efmi_root.join(persist_bridge::BRIDGE_DIR).exists());
+        assert_eq!(fs::read_to_string(&ini).unwrap(), original_ini);
+        cfg.persist_bridge_enabled = false;
+
+        // Keypress-only legacy files are allowed. A legacy INI backup, however, still indicates
+        // an unfinished restoration.
+        fs::write(&old_includer, keypress_only).unwrap();
+        fs::write(&external_backup, b"old backup").unwrap();
+        assert!(persist_bridge::sync_all_enabled_mods(&mut cfg).is_err());
+        assert_eq!(fs::read(&external_backup).unwrap(), b"old backup");
+        fs::remove_file(&external_backup).unwrap();
+
+        let legacy_ini = "[Constants]\r\n$\\QAQM\\Persist\\Bridge_123456abcdef\\state = 6\r\n";
+        let disabled_mod = mod_dir.with_file_name("DISABLED_旧状态皮肤");
+        fs::create_dir_all(&disabled_mod).unwrap();
+        fs::write(disabled_mod.join("old.ini"), legacy_ini).unwrap();
+        fs::write(disabled_mod.join("old.ini.qaqm-persistbak"), b"unrestored backup").unwrap();
+        let mut snapshots = Vec::new();
+        for name in ["_ps_t_draw_fix_backup_20261001_035827", ".efmm-backups"] {
+            let snapshot_dir = mod_dir.join(name);
+            fs::create_dir_all(&snapshot_dir).unwrap();
+            fs::write(snapshot_dir.join("legacy.ini"), legacy_ini).unwrap();
+            fs::write(snapshot_dir.join("original.ini"), original_ini).unwrap();
+            snapshots.push(snapshot_dir);
+        }
+
+        let hash = persist_bridge::compute_ini_hash12(&mods_root, &ini);
+        let user_ini = efmi_root.join("d3dx_user.ini");
+        let external_entries = format!(
+            "[Constants]\r\n$\\qaqm\\persist\\bridge_{hash}\\state = 99\r\n$\\Example\\Native\\state = 7\r\n"
+        );
+        fs::write(&user_ini, &external_entries).unwrap();
+        let status = persist_bridge::sync_all_enabled_mods(&mut cfg).unwrap();
+        assert!(status.enabled && status.d3dx_mounted);
+        assert!(!status.legacy_conflict);
+        assert_eq!(status.active_state_count, 1);
+        let cache = efmi_root.join("efmm").join("cache").join(format!("efmm_state_{hash}.ini"));
+        assert!(fs::read_to_string(&cache).unwrap().contains("global persist $state = 2"));
+        for snapshot in snapshots {
+            let original = snapshot.join("original.ini");
+            assert_eq!(fs::read_to_string(&original).unwrap(), original_ini);
+            assert!(!persist_bridge::backup_path(&original).exists());
+            assert_eq!(fs::read_to_string(snapshot.join("legacy.ini")).unwrap(), legacy_ini);
+        }
+
+        // Reset cleans only EFMM-owned state, leaving unrelated raw bytes and values intact.
+        let file_bytes = format!("{external_entries}$\\efmm\\persist\\bridge_{hash}\\state = 4\r\n");
+        fs::write(&user_ini, file_bytes).unwrap();
+        assert!(persist_bridge::reset_mod_ini(&mut cfg, "佩丽卡", "试装").unwrap() > 0);
+        assert_eq!(fs::read_to_string(&user_ini).unwrap(), external_entries);
+        assert!(fs::read_to_string(&cache).unwrap().contains("global persist $state = 2"));
+        let status = persist_bridge::disable_and_restore_all(&mut cfg).unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.active_state_count, 0);
+        assert_eq!(fs::read_to_string(&ini).unwrap(), original_ini);
+        assert_eq!(fs::read_to_string(&old_includer).unwrap(), keypress_only);
+        assert_eq!(fs::read(&old_cache).unwrap(), b"old state");
+        assert_eq!(fs::read_to_string(disabled_mod.join("old.ini")).unwrap(), legacy_ini);
+        assert_eq!(fs::read(disabled_mod.join("old.ini.qaqm-persistbak")).unwrap(), b"unrestored backup");
+        assert!(fs::read(&d3dx).unwrap().ends_with(b"; stock \xa1\xaa\r\n"));
         let _ = fs::remove_dir_all(efmi_root);
     }
 
@@ -1988,5 +2209,78 @@ hash = 1234ABCD
         assert_eq!(fs::read_to_string(mod_dir.join("mod.ini")).unwrap(), orig_ini);
 
         let _ = fs::remove_dir_all(efmi_root);
+    }
+
+    #[test]
+    fn test_case_only_rename_assign_preserve_and_organizer_self_skip() {
+        let root = make_temp_dir("bugfixes");
+        let mods_root = root.join("Mods");
+        let src_mod = mods_root.join("伊冯").join("SkinLower");
+        fs::create_dir_all(&src_mod).unwrap();
+        fs::create_dir_all(mods_root.join("佩丽卡")).unwrap();
+        fs::write(
+            src_mod.join("tags.json"),
+            r#"{"qaqm":{"appearanceSectionId":"base","customField":"keep-me"},"tags":["测试"]}"#,
+        )
+        .unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.mods_path = mods_root.to_string_lossy().to_string();
+
+        // 1. Case-only rename works on case-insensitive NTFS
+        mods::rename_mod(&mut cfg, "伊冯", "SkinLower", "skinlower").unwrap();
+        let renamed_dir = mods_root.join("伊冯").join("skinlower");
+        assert!(renamed_dir.is_dir());
+
+        // 2. assign_mod_section preserves existing qaqm keys
+        mods::assign_mod_section(&cfg, "伊冯", "skinlower", "sec_custom").unwrap();
+        let raw_tags = fs::read_to_string(renamed_dir.join("tags.json")).unwrap();
+        let val: Value = serde_json::from_str(&raw_tags).unwrap();
+        assert_eq!(val["qaqm"]["appearanceSectionId"].as_str(), Some("sec_custom"));
+        assert_eq!(val["qaqm"]["customField"].as_str(), Some("keep-me"));
+
+        // 3. Organizer self-move (source == target) does not rename to "skinlower (2)"
+        let org_res = organizer::execute_organize_actions(
+            &cfg,
+            vec![("伊冯".to_string(), "skinlower".to_string(), "伊冯".to_string())],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(org_res.moved_count, 0);
+        assert!(renamed_dir.is_dir());
+        assert!(!mods_root.join("伊冯").join("skinlower (2)").exists());
+
+        // 4. Moving mod across characters migrates modAddedAt and presets
+        cfg.mod_added_at.insert("伊冯/skinlower".to_string(), 123456);
+        let mut store = config::load_presets().unwrap();
+        let unique_name = format!(
+            "移动联动测试_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        presets::create_preset_in(
+            &mut store,
+            &cfg,
+            &unique_name,
+            "",
+            Some(vec![PresetModEntry {
+                character_name: "伊冯".to_string(),
+                mod_name: "skinlower".to_string(),
+                enabled: true,
+            }]),
+            false,
+        )
+        .unwrap();
+        config::save_presets(&store).unwrap();
+        mods::move_mod_to_character(&mut cfg, "伊冯", "skinlower", "佩丽卡").unwrap();
+        assert!(cfg.mod_added_at.contains_key("佩丽卡/skinlower"));
+        assert!(!cfg.mod_added_at.contains_key("伊冯/skinlower"));
+        let store = config::load_presets().unwrap();
+        let moved_preset = store.presets.iter().find(|p| p.name == unique_name).unwrap();
+        assert_eq!(moved_preset.mods[0].character_name, "佩丽卡");
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -13,6 +13,7 @@ import { api } from "../../lib/tauri";
 import { useAppStore } from "../../store/useAppStore";
 import type { CharacterItem, OrganizeScanReport } from "../../types/mod";
 import { Modal } from "../ui/Modal";
+import { SelectMenu } from "../ui/SelectMenu";
 
 interface OrganizeModalProps {
   open: boolean;
@@ -195,7 +196,7 @@ export function OrganizeModal({ open, onClose }: OrganizeModalProps) {
               type="button"
               onClick={() => void handleApplyDualOrganize()}
               disabled={busy}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
             >
               <Sparkles className="h-3.5 w-3.5" />
               <span>
@@ -246,7 +247,7 @@ export function OrganizeModal({ open, onClose }: OrganizeModalProps) {
                   type="button"
                   onClick={() => void handleCreateDefaultChars()}
                   disabled={busy}
-                  className="rounded-xl bg-[var(--accent)] px-3 py-1.5 text-[11px] font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                  className="rounded-xl bg-[var(--accent-fill)] px-3 py-1.5 text-[11px] font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
                 >
                   一键补全全部标准目录
                 </button>
@@ -359,22 +360,19 @@ export function OrganizeModal({ open, onClose }: OrganizeModalProps) {
                     </label>
                     <div className="flex items-center gap-1.5">
                       <span className="text-[11px] text-[var(--text-muted)]">移至</span>
-                      <select
+                      <SelectMenu
+                        aria-label={`将「${item.modName}」移至`}
+                        size="compact"
+                        disabled={busy}
                         value={moveTargets[item.path] || item.suggestedCharacter}
-                        onChange={(e) =>
+                        onChange={(value) =>
                           setMoveTargets((prev) => ({
                             ...prev,
-                            [item.path]: e.target.value,
+                            [item.path]: value,
                           }))
                         }
-                        className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1 text-xs text-[var(--text-primary)]"
-                      >
-                        {characterNames.map((name) => (
-                          <option key={name} value={name}>
-                            {name}
-                          </option>
-                        ))}
-                      </select>
+                        options={characterNames.map((name) => ({ value: name, label: name }))}
+                      />
                     </div>
                   </div>
                 ))}

@@ -22,6 +22,7 @@ export interface ContextMenuState {
   x: number;
   y: number;
   items: ContextMenuItem[];
+  anchor?: HTMLButtonElement;
 }
 
 interface ContextMenuProps {
@@ -31,7 +32,14 @@ interface ContextMenuProps {
 
 export function ContextMenu({ menu, onClose }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const activeMenuRef = useRef<ContextMenuState | null>(null);
   const [pos, setPos] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
+
+  useEffect(() => {
+    if (!menu?.anchor || activeMenuRef.current === menu) return;
+    activeMenuRef.current = menu;
+    menuRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus({ preventScroll: true });
+  }, [menu]);
 
   useEffect(() => {
     if (!menu) return;
@@ -49,12 +57,18 @@ export function ContextMenu({ menu, onClose }: ContextMenuProps) {
     if (!menu) return;
 
     const handleMouseDown = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node) && !menu.anchor?.contains(e.target as Node)) {
         onClose();
       }
     };
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && !e.defaultPrevented) {
+        if (menu.anchor) {
+          e.preventDefault();
+          menu.anchor.focus({ preventScroll: true });
+        }
+        onClose();
+      }
     };
     const handleDismiss = () => onClose();
 
@@ -81,6 +95,23 @@ export function ContextMenu({ menu, onClose }: ContextMenuProps) {
           exit={{ opacity: 0, scale: 0.96 }}
           transition={{ duration: 0.12, ease: "easeOut" }}
           style={{ left: pos.left, top: pos.top }}
+          role={menu.anchor ? "menu" : undefined}
+          aria-label={menu.anchor ? "更多操作" : undefined}
+          onKeyDown={(event) => {
+            if (!menu.anchor) return;
+            if (event.key === "Tab") {
+              menu.anchor.focus({ preventScroll: true });
+              onClose();
+              return;
+            }
+            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+            const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+            const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 :
+              (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+            event.preventDefault();
+            buttons[next]?.focus({ preventScroll: true });
+          }}
           onContextMenu={(e) => e.preventDefault()}
           className="glass-surface-strong fixed z-[70] min-w-[216px] max-w-[300px] rounded-xl p-1.5 shadow-[var(--shadow-floating)]"
         >
@@ -97,9 +128,11 @@ export function ContextMenu({ menu, onClose }: ContextMenuProps) {
               <button
                 key={item.key}
                 type="button"
+                role={menu.anchor ? "menuitem" : undefined}
                 disabled={item.disabled}
                 onClick={() => {
                   if (item.disabled) return;
+                  menu.anchor?.focus({ preventScroll: true });
                   onClose();
                   item.onClick();
                 }}

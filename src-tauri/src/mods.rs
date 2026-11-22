@@ -251,6 +251,92 @@ pub fn list_mods(cfg: &AppConfig, character_name: &str) -> Result<ModListRespons
     })
 }
 
+pub(crate) struct ModStateChange {
+    pub(crate) delta: UndoDelta,
+    source: PathBuf,
+    target: PathBuf,
+}
+
+impl ModStateChange {
+    pub(crate) fn new(
+        source: PathBuf,
+        character_name: String,
+        mod_name: String,
+        enable: bool,
+    ) -> Self {
+        let target = if enable {
+            source.with_file_name(&mod_name)
+        } else {
+            source.with_file_name(format!("DISABLED_{mod_name}"))
+        };
+        Self {
+            delta: UndoDelta {
+                character_name,
+                mod_name,
+                prev_enabled: !enable,
+                new_enabled: enable,
+            },
+            source,
+            target,
+        }
+    }
+}
+
+pub(crate) fn apply_mod_state_changes(
+    cfg: &mut AppConfig,
+    changes: &[ModStateChange],
+    commit: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    for change in changes {
+        if !change.source.is_dir() {
+            return Err(format!("源目录不可用：{}", change.source.display()));
+        }
+        match change.target.try_exists() {
+            Ok(false) => {}
+            Ok(true) => return Err(format!("目标路径已存在：{}", change.target.display())),
+            Err(err) => return Err(format!("无法检查目标路径 {}：{err}", change.target.display())),
+        }
+        if change.delta.new_enabled {
+            persist_bridge::check_mod_enable(cfg, &change.source)?;
+        }
+    }
+
+    // Keep the bridge untouched until every folder move and the preset save succeed.
+    let mut applied = 0;
+    let result = changes
+        .iter()
+        .try_for_each(|change| {
+            rename_dir_with_retry(&change.source, &change.target)?;
+            applied += 1;
+            Ok(())
+        })
+        .and_then(|()| commit());
+    if let Err(err) = result {
+        let mut rollback_errors = Vec::new();
+        for change in changes[..applied].iter().rev() {
+            if let Err(rollback_err) = rename_dir_with_retry(&change.target, &change.source) {
+                rollback_errors.push(format!("{}：{rollback_err}", change.source.display()));
+            }
+        }
+        if rollback_errors.is_empty() {
+            return Err(err);
+        }
+        return Err(format!("{err}。以下目录未能恢复：{}", rollback_errors.join("；")));
+    }
+
+    if cfg.persist_bridge_enabled && !changes.is_empty() {
+        for change in changes {
+            if change.delta.new_enabled {
+                persist_bridge::on_mod_enabled(cfg, &change.target);
+            } else {
+                persist_bridge::on_mod_disabled(cfg, &change.target);
+            }
+        }
+        let _ = save_config(cfg);
+    }
+    Ok(())
+}
+
 pub fn toggle_mod(
     cfg: &mut AppConfig,
     undo_stack: &Mutex<UndoStack>,
@@ -310,86 +396,57 @@ pub fn toggle_mod(
         }
     }
 
-    let mut deltas = Vec::new();
-
-    for active in pending_rfx_disable {
-        let src = PathBuf::from(&active.path);
-        let dst_name = format!("DISABLED_{}", active.mod_name);
-        if let Some(parent) = src.parent() {
-            let dst = parent.join(dst_name);
-            rename_dir_with_retry(&src, &dst)?;
-            if cfg.persist_bridge_enabled {
-                persist_bridge::on_mod_disabled(cfg, &dst);
-            }
-            deltas.push(UndoDelta {
-                character_name: active.character_name,
-                mod_name: active.mod_name,
-                prev_enabled: true,
-                new_enabled: false,
-            });
-        }
-    }
+    let mut changes: Vec<_> = pending_rfx_disable
+        .into_iter()
+        .map(|active| {
+            ModStateChange::new(
+                PathBuf::from(active.path),
+                active.character_name,
+                active.mod_name,
+                false,
+            )
+        })
+        .collect();
 
     // Exclusive mode: disable other enabled mods under same character
     if enable && exclusive {
-        if let Ok(entries) = fs::read_dir(&char_dir) {
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let dir_name = entry.file_name().to_string_lossy().to_string();
-                if dir_name.starts_with('.')
-                    || dir_name.to_ascii_uppercase().starts_with("DISABLED_")
-                    || dir_name == safe_mod
-                {
-                    continue;
-                }
-                let disabled_dst = char_dir.join(format!("DISABLED_{dir_name}"));
-                rename_dir_with_retry(&entry.path(), &disabled_dst)?;
-                if cfg.persist_bridge_enabled {
-                    persist_bridge::on_mod_disabled(cfg, &disabled_dst);
-                }
-                deltas.push(UndoDelta {
-                    character_name: safe_char.clone(),
-                    mod_name: dir_name,
-                    prev_enabled: true,
-                    new_enabled: false,
-                });
+        let entries = fs::read_dir(&char_dir).map_err(|e| format!("读取角色目录失败：{e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取 Mod 目录失败：{e}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("读取 Mod 目录属性失败：{e}"))?;
+            if !file_type.is_dir() {
+                continue;
             }
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let source = entry.path();
+            if dir_name.starts_with('.')
+                || dir_name.to_ascii_uppercase().starts_with("DISABLED_")
+                || dir_name == safe_mod
+                || changes.iter().any(|change| change.source == source)
+            {
+                continue;
+            }
+            changes.push(ModStateChange::new(source, safe_char.clone(), dir_name, false));
         }
     }
 
-    let target_name = if enable {
-        safe_mod.clone()
+    changes.push(ModStateChange::new(
+        current_path,
+        safe_char,
+        safe_mod.clone(),
+        enable,
+    ));
+    let mut guard = undo_stack.lock().map_err(|_| "撤销栈锁异常".to_string())?;
+    apply_mod_state_changes(cfg, &changes, || Ok(()))?;
+    let action_label = if enable {
+        format!("启用 Mod：{safe_mod}")
     } else {
-        format!("DISABLED_{safe_mod}")
+        format!("禁用 Mod：{safe_mod}")
     };
-    let target_path = char_dir.join(target_name);
-    rename_dir_with_retry(&current_path, &target_path)?;
-    if cfg.persist_bridge_enabled {
-        if enable {
-            persist_bridge::on_mod_enabled(cfg, &target_path);
-        } else {
-            persist_bridge::on_mod_disabled(cfg, &target_path);
-        }
-        let _ = save_config(cfg);
-    }
-
-    deltas.push(UndoDelta {
-        character_name: safe_char,
-        mod_name: safe_mod.clone(),
-        prev_enabled: !enable,
-        new_enabled: enable,
-    });
-
-    if let Ok(mut guard) = undo_stack.lock() {
-        let action_label = if enable {
-            format!("启用 Mod：{safe_mod}")
-        } else {
-            format!("禁用 Mod：{safe_mod}")
-        };
-        guard.push(action_label, deltas, false, None);
-    }
+    let deltas = changes.into_iter().map(|change| change.delta).collect();
+    guard.push(&cfg.mods_path, action_label, deltas, false, None);
 
     Ok(ToggleModResult {
         success: true,
@@ -398,6 +455,62 @@ pub fn toggle_mod(
         active_rabbit_fx: Vec::new(),
         message: None,
     })
+}
+
+#[cfg(test)]
+mod state_change_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_exclusive_toggle_and_undo_preserve_mods_and_history() {
+        let root = std::env::temp_dir().join(format!("efmm-toggle-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let mods = root.join("Mods");
+        let character = mods.join("伊冯");
+        let skin_a = character.join("SkinA");
+        let disabled_a = character.join("DISABLED_SkinA");
+        let skin_b = character.join("SkinB");
+        let disabled_b = character.join("DISABLED_SkinB");
+        fs::create_dir_all(&skin_a).unwrap();
+        fs::create_dir_all(&disabled_b).unwrap();
+        fs::write(&skin_b, "occupied").unwrap();
+        let mut cfg = AppConfig {
+            mods_path: mods.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let undo_stack = Mutex::new(UndoStack::default());
+
+        assert!(toggle_mod(&mut cfg, &undo_stack, "伊冯", "SkinB", true, true, false).is_err());
+        assert!(skin_a.is_dir());
+        assert!(disabled_b.is_dir());
+        assert!(undo_stack.lock().unwrap().summaries().is_empty());
+
+        fs::remove_file(&skin_b).unwrap();
+        toggle_mod(&mut cfg, &undo_stack, "伊冯", "SkinB", true, true, false).unwrap();
+
+        let mut undo = undo_stack.lock().unwrap();
+        let second_library = root.join("OtherMods");
+        let second_skin_b = second_library.join("伊冯").join("SkinB");
+        fs::create_dir_all(&second_skin_b).unwrap();
+        cfg.mods_path = second_library.to_string_lossy().into_owned();
+        assert!(undo.undo_last(&mut cfg).is_err());
+        assert!(second_skin_b.is_dir());
+        assert_eq!(undo.summaries().len(), 1);
+
+        cfg.mods_path = mods.to_string_lossy().into_owned();
+        fs::write(&skin_a, "occupied").unwrap();
+        assert!(undo.undo_last(&mut cfg).is_err());
+        assert!(skin_b.is_dir());
+        assert!(disabled_a.is_dir());
+        assert_eq!(undo.summaries().len(), 1);
+
+        fs::remove_file(&skin_a).unwrap();
+        assert_eq!(undo.undo_last(&mut cfg).unwrap().reverted_count, 2);
+        assert!(skin_a.is_dir());
+        assert!(disabled_b.is_dir());
+        assert!(undo.summaries().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn read_readme_in_mod(mod_dir: &Path) -> String {
@@ -485,8 +598,12 @@ pub fn rename_mod(
         format!("DISABLED_{new_safe}")
     };
     let new_dir = char_dir.join(new_dir_name);
-    // Prevent renaming over enabled/disabled sibling with same clean name
-    if char_dir.join(&new_safe).exists() || char_dir.join(format!("DISABLED_{new_safe}")).exists() {
+    let same_ci = old_safe.eq_ignore_ascii_case(&new_safe);
+    // Prevent renaming over enabled/disabled sibling with same clean name unless case-only rename
+    if !same_ci
+        && (char_dir.join(&new_safe).exists()
+            || char_dir.join(format!("DISABLED_{new_safe}")).exists())
+    {
         return Err(format!("同名 Mod「{new_safe}」已存在"));
     }
     rename_dir_with_retry(&old_dir, &new_dir)?;
@@ -596,7 +713,27 @@ pub fn move_mod_to_character(
     if let Some(order) = cfg.mod_orders.get_mut(&src_char) {
         order.retain(|x| x != &safe_mod);
     }
+    let old_added_key = format!("{src_char}/{safe_mod}");
+    if let Some(ms) = cfg.mod_added_at.remove(&old_added_key) {
+        cfg.mod_added_at
+            .insert(format!("{dst_char}/{safe_mod}"), ms);
+    }
     save_config(cfg)?;
+
+    if let Ok(mut presets) = load_presets() {
+        let mut changed = false;
+        for preset in &mut presets.presets {
+            for m in &mut preset.mods {
+                if m.character_name == src_char && m.mod_name == safe_mod {
+                    m.character_name = dst_char.clone();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let _ = save_presets(&presets);
+        }
+    }
     Ok(())
 }
 
@@ -613,11 +750,24 @@ pub fn assign_mod_section(
     } else {
         section_id.trim()
     };
-    tags_file.qaqm = Some(serde_json::json!({
-        "appearanceSectionId": clean_sec,
-        "classificationSource": "manual",
-        "appearanceAssignedAt": now_iso_utc(),
-    }));
+    let now = now_iso_utc();
+    if !matches!(tags_file.qaqm, Some(serde_json::Value::Object(_))) {
+        tags_file.qaqm = Some(serde_json::json!({}));
+    }
+    if let Some(serde_json::Value::Object(map)) = tags_file.qaqm.as_mut() {
+        map.insert(
+            "appearanceSectionId".to_string(),
+            serde_json::Value::String(clean_sec.to_string()),
+        );
+        map.insert(
+            "classificationSource".to_string(),
+            serde_json::Value::String("manual".to_string()),
+        );
+        map.insert(
+            "appearanceAssignedAt".to_string(),
+            serde_json::Value::String(now),
+        );
+    }
     write_mod_tags_file(&mod_dir, &mut tags_file)
 }
 

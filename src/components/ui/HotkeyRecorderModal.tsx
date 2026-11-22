@@ -94,6 +94,8 @@ export function HotkeyRecorderModal({
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
         setListening(false);
         return;
       }
@@ -181,7 +183,7 @@ export function HotkeyRecorderModal({
             type="button"
             onClick={() => void handleConfirm()}
             disabled={saving || !expr.trim()}
-            className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-45"
+            className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-45"
           >
             {saving ? "写回 INI..." : "保存并写回 INI"}
           </button>

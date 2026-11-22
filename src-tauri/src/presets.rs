@@ -1,13 +1,13 @@
 use crate::characters::{is_non_character_category, now_iso_utc};
-use crate::config::{load_presets, save_config, save_presets};
-use crate::fs_ops::{assert_safe_segment, rename_dir_with_retry};
+use crate::config::{load_presets, save_presets};
+use crate::fs_ops::assert_safe_segment;
 use crate::ini_engine::{collect_ini_files, scan_mod_flags};
 use crate::models::{
     AppConfig, ApplyPresetResult, CatalogModEntry, CharacterModsCatalog, ModPreset,
     PresetImportResult, PresetItemView, PresetListResponse, PresetModEntry, PresetStore,
-    RabbitFxModEntry, UndoDelta,
+    RabbitFxModEntry,
 };
-use crate::persist_bridge;
+use crate::mods::{apply_mod_state_changes, ModStateChange};
 use crate::undo::UndoStack;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -121,12 +121,45 @@ pub fn list_all_mods_catalog(cfg: &AppConfig) -> Result<Vec<CharacterModsCatalog
 }
 
 pub fn list_presets_in(store: &PresetStore, cfg: &AppConfig) -> PresetListResponse {
-    let disk_mods = scan_disk_mods(Path::new(&cfg.mods_path));
-    let any_enabled = disk_mods.iter().any(|m| m.enabled);
-    let disk_map: HashMap<(String, String), &DiskModInfo> = disk_mods
+    let mods_root = Path::new(&cfg.mods_path);
+    let library_available = !cfg.mods_path.trim().is_empty() && fs::read_dir(mods_root).is_ok();
+    let disk_mods = scan_disk_mods(mods_root);
+    let disk_map: HashMap<(&str, &str), &DiskModInfo> = disk_mods
         .iter()
-        .map(|m| ((m.character_name.clone(), m.mod_name.clone()), m))
+        .map(|m| ((m.character_name.as_str(), m.mod_name.as_str()), m))
         .collect();
+    let enabled: HashSet<_> = disk_mods
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| (m.character_name.as_str(), m.mod_name.as_str()))
+        .collect();
+    let builtin_no_mod_active = library_available && enabled.is_empty();
+    let active_preset_id = store
+        .active_preset_id
+        .as_ref()
+        .filter(|id| {
+            if !library_available {
+                return false;
+            }
+            if id.as_str() == BUILTIN_NO_MOD_ID {
+                return builtin_no_mod_active;
+            }
+            store
+                .presets
+                .iter()
+                .find(|p| &p.id == *id)
+                .is_some_and(|preset| {
+                    let installed_targets: HashSet<_> = preset
+                        .mods
+                        .iter()
+                        .filter(|entry| entry.enabled)
+                        .map(|entry| (entry.character_name.as_str(), entry.mod_name.as_str()))
+                        .filter(|key| disk_map.contains_key(key))
+                        .collect();
+                    installed_targets == enabled
+                })
+        })
+        .cloned();
 
     let presets = store
         .presets
@@ -141,7 +174,7 @@ pub fn list_presets_in(store: &PresetStore, cfg: &AppConfig) -> PresetListRespon
                     continue;
                 }
                 chars.insert(entry.character_name.clone());
-                let key = (entry.character_name.clone(), entry.mod_name.clone());
+                let key = (entry.character_name.as_str(), entry.mod_name.as_str());
                 if let Some(dm) = disk_map.get(&key) {
                     if dm.is_rabbit_fx {
                         rabbit_fx_count += 1;
@@ -168,8 +201,8 @@ pub fn list_presets_in(store: &PresetStore, cfg: &AppConfig) -> PresetListRespon
         .collect();
 
     PresetListResponse {
-        active_preset_id: store.active_preset_id.clone(),
-        builtin_no_mod_active: !any_enabled,
+        active_preset_id,
+        builtin_no_mod_active,
         presets,
     }
 }
@@ -311,6 +344,24 @@ pub fn apply_preset_with_store(
     id: &str,
     force_allow_multiple_rabbit_fx: bool,
 ) -> Result<ApplyPresetResult, String> {
+    apply_preset_transaction(
+        store,
+        cfg,
+        undo_stack,
+        id,
+        force_allow_multiple_rabbit_fx,
+        |_| Ok(()),
+    )
+}
+
+fn apply_preset_transaction(
+    store: &mut PresetStore,
+    cfg: &mut AppConfig,
+    undo_stack: &Mutex<UndoStack>,
+    id: &str,
+    force_allow_multiple_rabbit_fx: bool,
+    save_store: impl FnOnce(&PresetStore) -> Result<(), String>,
+) -> Result<ApplyPresetResult, String> {
     let mods_root = Path::new(&cfg.mods_path).to_path_buf();
     if cfg.mods_path.trim().is_empty() || !mods_root.is_dir() {
         return Err("Mods 目录未配置或不存在".to_string());
@@ -375,62 +426,39 @@ pub fn apply_preset_with_store(
         });
     }
 
-    let mut deltas = Vec::new();
-    let mut enabled_count = 0usize;
-    let mut disabled_count = 0usize;
-
-    // Disable mods first so clean names don't collide unnecessarily
+    let mut changes = Vec::new();
     for dm in &disk_mods {
         let should_enable =
             target_enabled_set.contains(&(dm.character_name.clone(), dm.mod_name.clone()));
-        if dm.enabled && !should_enable {
-            let safe_char = assert_safe_segment(&dm.character_name, "角色名称")?;
-            let safe_mod = assert_safe_segment(&dm.mod_name, "Mod 名称")?;
-            let dst = mods_root.join(&safe_char).join(format!("DISABLED_{safe_mod}"));
-            rename_dir_with_retry(&dm.path, &dst)?;
-            if cfg.persist_bridge_enabled {
-                persist_bridge::on_mod_disabled(cfg, &dst);
-            }
-            deltas.push(UndoDelta {
-                character_name: dm.character_name.clone(),
-                mod_name: dm.mod_name.clone(),
-                prev_enabled: true,
-                new_enabled: false,
-            });
-            disabled_count += 1;
+        if dm.enabled != should_enable {
+            let character = assert_safe_segment(&dm.character_name, "角色名称")?;
+            let mod_name = assert_safe_segment(&dm.mod_name, "Mod 名称")?;
+            changes.push(ModStateChange::new(
+                dm.path.clone(),
+                character,
+                mod_name,
+                should_enable,
+            ));
         }
     }
+    changes.sort_by_key(|change| change.delta.new_enabled);
+    let enabled_count = changes
+        .iter()
+        .filter(|change| change.delta.new_enabled)
+        .count();
+    let disabled_count = changes.len() - enabled_count;
 
-    for dm in &disk_mods {
-        let should_enable =
-            target_enabled_set.contains(&(dm.character_name.clone(), dm.mod_name.clone()));
-        if !dm.enabled && should_enable {
-            let safe_char = assert_safe_segment(&dm.character_name, "角色名称")?;
-            let safe_mod = assert_safe_segment(&dm.mod_name, "Mod 名称")?;
-            let dst = mods_root.join(&safe_char).join(&safe_mod);
-            rename_dir_with_retry(&dm.path, &dst)?;
-            if cfg.persist_bridge_enabled {
-                persist_bridge::on_mod_enabled(cfg, &dst);
-            }
-            deltas.push(UndoDelta {
-                character_name: dm.character_name.clone(),
-                mod_name: dm.mod_name.clone(),
-                prev_enabled: false,
-                new_enabled: true,
-            });
-            enabled_count += 1;
+    let mut guard = undo_stack.lock().map_err(|_| "撤销栈锁异常".to_string())?;
+    apply_mod_state_changes(cfg, &changes, || {
+        store.active_preset_id = Some(id.to_string());
+        if let Err(err) = save_store(store) {
+            store.active_preset_id.clone_from(&prev_active_id);
+            return Err(err);
         }
-    }
-
-    if let Ok(mut guard) = undo_stack.lock() {
-        guard.push(label, deltas, true, prev_active_id);
-    }
-
-    if cfg.persist_bridge_enabled {
-        let _ = save_config(cfg);
-    }
-
-    store.active_preset_id = Some(id.to_string());
+        Ok(())
+    })?;
+    let deltas = changes.into_iter().map(|change| change.delta).collect();
+    guard.push(&cfg.mods_path, label, deltas, true, prev_active_id);
 
     Ok(ApplyPresetResult {
         success: true,
@@ -450,17 +478,190 @@ pub fn apply_preset(
     force_allow_multiple_rabbit_fx: bool,
 ) -> Result<ApplyPresetResult, String> {
     let mut store = load_presets()?;
-    let res = apply_preset_with_store(
+    apply_preset_transaction(
         &mut store,
         cfg,
         undo_stack,
         id,
         force_allow_multiple_rabbit_fx,
-    )?;
-    if res.success {
-        save_presets(&store)?;
+        save_presets,
+    )
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_legacy_mod_is_guarded_by_toggle_preset_and_undo() {
+        let root = std::env::temp_dir().join(format!("efmm-preset-legacy-{}", std::process::id()));
+        let mods = root.join("Mods");
+        let character = mods.join("伊冯");
+        let clean_disabled = character.join("DISABLED_Clean");
+        let clean = character.join("Clean");
+        let stale_disabled = character.join("DISABLED_Stale");
+        let stale = character.join("Stale");
+        fs::create_dir_all(&clean_disabled).unwrap();
+        fs::create_dir_all(stale_disabled.join("sub")).unwrap();
+        fs::write(
+            stale_disabled.join("sub").join("stale.ini"),
+            "[Present]\nif $\\QAQM\\Persist\\Bridge_123456abcdef\\state == 1\nendif\n",
+        )
+        .unwrap();
+        let mut cfg = AppConfig {
+            mods_path: mods.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let undo_stack = Mutex::new(UndoStack::default());
+        let mut store = PresetStore::default();
+        let make_entry = |name: &str| PresetModEntry {
+            character_name: "伊冯".into(),
+            mod_name: name.into(),
+            enabled: true,
+        };
+        let mixed = create_preset_in(
+            &mut store,
+            &cfg,
+            "混合预设",
+            "",
+            Some(vec![make_entry("Clean"), make_entry("Stale")]),
+            false,
+        )
+        .unwrap();
+        let clean_only = create_preset_in(
+            &mut store,
+            &cfg,
+            "干净预设",
+            "",
+            Some(vec![make_entry("Clean")]),
+            false,
+        )
+        .unwrap();
+
+        let toggle = |cfg: &mut AppConfig, enable| {
+            crate::mods::toggle_mod(cfg, &undo_stack, "伊冯", "Stale", enable, false, false)
+        };
+        assert!(toggle(&mut cfg, true).unwrap_err().contains("stale.ini"));
+        let error = apply_preset_transaction(&mut store, &mut cfg, &undo_stack, &mixed.id, false, |_| {
+            panic!("预设包含旧桥接残留，禁止写入")
+        })
+        .unwrap_err();
+        assert!(error.contains("stale.ini"));
+        assert!(clean_disabled.is_dir() && stale_disabled.is_dir());
+        assert!(store.active_preset_id.is_none());
+        assert!(undo_stack.lock().unwrap().summaries().is_empty());
+
+        assert!(apply_preset_with_store(&mut store, &mut cfg, &undo_stack, &clean_only.id, false)
+            .unwrap()
+            .success);
+        assert!(clean.is_dir() && stale_disabled.is_dir());
+
+        // A mod already enabled outside the manager can still be disabled, even if undo cannot re-enable it.
+        fs::rename(&stale_disabled, &stale).unwrap();
+        assert!(toggle(&mut cfg, false).unwrap().success);
+        let mut undo = undo_stack.lock().unwrap();
+        assert!(undo.undo_last(&mut cfg).unwrap_err().contains("stale.ini"));
+        assert!(clean.is_dir() && stale_disabled.is_dir());
+        assert_eq!(undo.summaries().len(), 2);
+        fs::remove_dir_all(root).unwrap();
     }
-    Ok(res)
+
+    #[test]
+    fn active_preset_matches_installed_enabled_mods() {
+        let root = std::env::temp_dir().join(format!("efmm-preset-active-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let character = root.join("伊冯");
+        let skin = character.join("SkinA");
+        let disabled_skin = character.join("DISABLED_SkinA");
+        let extra = character.join("SkinB");
+        let disabled_extra = character.join("DISABLED_SkinB");
+        fs::create_dir_all(&skin).unwrap();
+        fs::create_dir_all(&disabled_extra).unwrap();
+        let cfg = AppConfig {
+            mods_path: root.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let mut store = PresetStore::default();
+        let preset = create_preset_in(
+            &mut store,
+            &cfg,
+            "伊冯",
+            "",
+            Some(
+                ["SkinA", "Missing"]
+                    .into_iter()
+                    .map(|mod_name| PresetModEntry {
+                        character_name: "伊冯".into(),
+                        mod_name: mod_name.into(),
+                        enabled: true,
+                    })
+                    .collect(),
+            ),
+            false,
+        )
+        .unwrap();
+        store.active_preset_id = Some(preset.id.clone());
+        let state = list_presets_in(&store, &cfg);
+        assert_eq!(state.active_preset_id.as_deref(), Some(preset.id.as_str()));
+        assert_eq!(state.presets[0].missing_count, 1);
+
+        fs::rename(&disabled_extra, &extra).unwrap();
+        assert_eq!(list_presets_in(&store, &cfg).active_preset_id, None);
+
+        store.active_preset_id = Some(BUILTIN_NO_MOD_ID.into());
+        let state = list_presets_in(&store, &cfg);
+        assert_eq!(state.active_preset_id, None);
+        assert!(!state.builtin_no_mod_active);
+
+        fs::rename(&extra, &disabled_extra).unwrap();
+        fs::rename(&skin, &disabled_skin).unwrap();
+        let state = list_presets_in(&store, &cfg);
+        assert_eq!(state.active_preset_id.as_deref(), Some(BUILTIN_NO_MOD_ID));
+        assert!(state.builtin_no_mod_active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_preset_save_rolls_back_renames_before_updating_bridge_or_history() {
+        let root = std::env::temp_dir().join(format!("efmm-preset-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let mods = root.join("Mods");
+        let character = mods.join("伊冯");
+        let enabled = character.join("SkinA");
+        let disabled = character.join("DISABLED_SkinA");
+        fs::create_dir_all(&enabled).unwrap();
+        let mut cfg = AppConfig {
+            mods_path: mods.to_string_lossy().into_owned(),
+            persist_bridge_enabled: true,
+            ..AppConfig::default()
+        };
+        let mut store = PresetStore {
+            active_preset_id: Some("previous".into()),
+            ..PresetStore::default()
+        };
+        let undo_stack = Mutex::new(UndoStack::default());
+
+        let result = apply_preset_transaction(
+            &mut store,
+            &mut cfg,
+            &undo_stack,
+            BUILTIN_NO_MOD_ID,
+            false,
+            |next| {
+                assert!(disabled.is_dir());
+                assert_eq!(next.active_preset_id.as_deref(), Some(BUILTIN_NO_MOD_ID));
+                Err("模拟预设写入失败".into())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), "模拟预设写入失败");
+        assert!(enabled.is_dir());
+        assert!(!disabled.exists());
+        assert!(!root.join(crate::persist_bridge::BRIDGE_DIR).exists());
+        assert_eq!(store.active_preset_id.as_deref(), Some("previous"));
+        assert!(undo_stack.lock().unwrap().summaries().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub fn export_presets_file(file_path: &Path) -> Result<usize, String> {
@@ -477,17 +678,10 @@ pub fn import_presets_file(file_path: &Path) -> Result<PresetImportResult, Strin
     let val: Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("解析预设 JSON 失败：{e}"))?;
 
-    // Support both EFMM PresetStore `{ presets: [...] }` and QAQManager `{ presetsByGame: { endfield: { presets: [...] } } }`
     let raw_list = val
         .get("presets")
         .and_then(|v| v.as_array())
-        .or_else(|| {
-            val.get("presetsByGame")
-                .and_then(|m| m.get("endfield"))
-                .and_then(|g| g.get("presets"))
-                .and_then(|v| v.as_array())
-        })
-        .ok_or_else(|| "无法识别的预设文件格式".to_string())?;
+        .ok_or_else(|| "请选择从 Endfield Mod Manager 导出的预设 JSON 文件".to_string())?;
 
     let mut store = load_presets()?;
     let mut existing_ids: HashSet<String> = store.presets.iter().map(|p| p.id.clone()).collect();

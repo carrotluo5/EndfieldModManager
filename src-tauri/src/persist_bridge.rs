@@ -1,13 +1,20 @@
 use crate::config::save_config;
 use crate::fs_ops::assert_safe_segment;
-use crate::ini_engine::collect_ini_files;
 use crate::models::{AppConfig, PersistBridgeStatus};
 use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
+
+pub const BRIDGE_DIR: &str = "efmm";
+pub const BRIDGE_INCLUDE: &str = "efmm\\efmm_includer.ini";
+pub const KEYPRESS_FILE: &str = "efmm_keypress.ini";
+pub const BACKUP_SUFFIX: &str = ".efmm-persistbak";
+const ACTIVE_FILE: &str = "efmm_persist_active.ini";
+const STATE_PREFIX: &str = "efmm_state_";
+const OWNED_STATE_MARKER: &str = "; EFMM persisted state: ";
 
 pub fn efmi_root_from_cfg(cfg: &AppConfig) -> Result<PathBuf, String> {
     let mods_root = Path::new(&cfg.mods_path);
@@ -26,11 +33,7 @@ pub fn compute_ini_hash12(mods_root: &Path, ini_path: &Path) -> String {
     for comp in rel.components() {
         if let std::path::Component::Normal(os) = comp {
             let s = os.to_string_lossy();
-            let clean = if s.len() >= 9 && s[..9].eq_ignore_ascii_case("DISABLED_") {
-                &s[9..]
-            } else {
-                s.as_ref()
-            };
+            let clean = strip_prefix_ignore_ascii_case(&s, "DISABLED_").unwrap_or(&s);
             parts.push(clean.to_ascii_lowercase());
         }
     }
@@ -42,131 +45,144 @@ pub fn compute_ini_hash12(mods_root: &Path, ini_path: &Path) -> String {
     hex.chars().take(12).collect()
 }
 
+fn ini_rule(line: &str) -> &str {
+    line.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .trim()
+}
+
+fn include_value(rule: &str) -> Option<String> {
+    let (key, value) = rule.split_once('=')?;
+    if !key.trim().eq_ignore_ascii_case("include") {
+        return None;
+    }
+    let value = value.trim().replace('/', "\\").to_ascii_lowercase();
+    Some(value.trim_start_matches(".\\").to_string())
+}
+
+fn is_include_section(rule: &str) -> Option<bool> {
+    Some(rule.strip_prefix('[')?.strip_suffix(']')?.trim().eq_ignore_ascii_case("include"))
+}
+
 pub fn ensure_d3dx_include(efmi_root: &Path) -> Result<bool, String> {
-    let d3dx_path = efmi_root.join("d3dx.ini");
-    if !d3dx_path.is_file() {
-        return Err(format!("未找到 d3dx.ini：{}", d3dx_path.display()));
+    let path = efmi_root.join("d3dx.ini");
+    let mut bytes = fs::read(&path)
+        .map_err(|e| format!("读取 d3dx.ini 失败（{}）：{e}", path.display()))?;
+    if bytes.contains(&0) {
+        return Err("d3dx.ini 使用了不支持的编码，无法添加 EFMM 挂载规则。".to_string());
     }
-    let bytes = fs::read(&d3dx_path).map_err(|e| format!("读取 d3dx.ini 失败：{e}"))?;
-    let raw = String::from_utf8_lossy(&bytes).into_owned();
-    let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
-    let ends_with_nl = raw.ends_with('\n');
-
-    let mut lines: Vec<String> = raw
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
-        .collect();
-    if ends_with_nl && lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-        lines.pop();
-    }
-
-    let mut include_header_idx: Option<usize> = None;
+    let eol = if bytes.windows(2).any(|pair| pair == b"\r\n") { "\r\n" } else { "\n" };
+    let mut header_end = None;
+    let mut offset = 0;
     let mut in_include = false;
-    let mut already_included = false;
-
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-            let sec = trimmed[1..trimmed.len() - 1].trim();
-            if sec.eq_ignore_ascii_case("include") {
-                include_header_idx = Some(idx);
-                in_include = true;
-            } else if in_include {
-                break;
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        offset += line.len();
+        let text = String::from_utf8_lossy(line);
+        let rule = ini_rule(&text);
+        if let Some(is_include) = is_include_section(rule) {
+            in_include = is_include;
+            if is_include && header_end.is_none() {
+                header_end = Some(offset);
             }
-            continue;
-        }
-        if !in_include || trimmed.is_empty() || trimmed.starts_with(';') {
-            continue;
-        }
-        if let Some((k, v)) = trimmed.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("include")
-                && v.to_ascii_lowercase().contains("qaqm_includer.ini")
-            {
-                already_included = true;
-                break;
-            }
+        } else if in_include && include_value(rule).as_deref() == Some(BRIDGE_INCLUDE) {
+            return Ok(false);
         }
     }
 
-    if already_included {
-        return Ok(false);
-    }
-
-    if let Some(hdr_idx) = include_header_idx {
-        lines.insert(hdr_idx + 1, "include = qaqm\\qaqm_includer.ini".to_string());
+    let include = format!("include = {BRIDGE_INCLUDE}{eol}");
+    if let Some(pos) = header_end {
+        let leading_eol = if bytes.get(pos.saturating_sub(1)) == Some(&b'\n') { "" } else { eol };
+        bytes.splice(pos..pos, format!("{leading_eol}{include}").bytes());
     } else {
-        lines.push(String::new());
-        lines.push("[Include]".to_string());
-        lines.push("include = qaqm\\qaqm_includer.ini".to_string());
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.extend_from_slice(eol.as_bytes());
+        }
+        bytes.extend_from_slice(format!("[Include]{eol}{include}").as_bytes());
     }
-
-    let mut out = lines.join(eol);
-    if ends_with_nl {
-        out.push_str(eol);
-    }
-    fs::write(&d3dx_path, out.as_bytes()).map_err(|e| format!("写入 d3dx.ini 失败：{e}"))?;
+    fs::write(&path, bytes).map_err(|e| format!("写入 d3dx.ini 失败：{e}"))?;
     Ok(true)
 }
 
 pub fn is_d3dx_mounted(efmi_root: &Path) -> bool {
-    let d3dx_path = efmi_root.join("d3dx.ini");
-    let Ok(raw) = fs::read_to_string(&d3dx_path) else {
+    let Ok(bytes) = fs::read(efmi_root.join("d3dx.ini")) else {
         return false;
     };
+    let raw = String::from_utf8_lossy(&bytes);
     let mut in_include = false;
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-            in_include = trimmed[1..trimmed.len() - 1]
-                .trim()
-                .eq_ignore_ascii_case("include");
-            continue;
+    raw.lines().any(|line| {
+        let rule = ini_rule(line);
+        if let Some(is_include) = is_include_section(rule) {
+            in_include = is_include;
         }
-        if in_include && !trimmed.starts_with(';') {
-            if let Some((k, v)) = trimmed.split_once('=') {
-                if k.trim().eq_ignore_ascii_case("include")
-                    && v.to_ascii_lowercase().contains("qaqm_includer.ini")
-                {
-                    return true;
-                }
-            }
-        }
+        in_include && include_value(rule).as_deref() == Some(BRIDGE_INCLUDE)
+    })
+}
+
+fn cache_dir(efmi_root: &Path) -> PathBuf {
+    efmi_root.join(BRIDGE_DIR).join("cache")
+}
+
+fn active_file(efmi_root: &Path) -> PathBuf {
+    efmi_root.join(BRIDGE_DIR).join(ACTIVE_FILE)
+}
+
+pub(crate) fn backup_path(ini: &Path) -> PathBuf {
+    let mut name = ini.file_name().unwrap_or_default().to_os_string();
+    name.push(BACKUP_SUFFIX);
+    ini.with_file_name(name)
+}
+
+fn is_owned_backup(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .strip_suffix(BACKUP_SUFFIX)
+        .is_some_and(|name| name.ends_with(".ini"))
+}
+
+fn state_file_hash(name: &str) -> Option<&str> {
+    let hash = name.strip_prefix(STATE_PREFIX)?.strip_suffix(".ini")?;
+    (hash.len() == 12 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hash)
+}
+
+pub(crate) fn ensure_keypress_files(efmi_root: &Path) -> Result<(), String> {
+    let efmm_dir = efmi_root.join(BRIDGE_DIR);
+    fs::create_dir_all(&efmm_dir).map_err(|e| format!("创建 EFMM 设置目录失败：{e}"))?;
+    let keypress_path = efmm_dir.join(KEYPRESS_FILE);
+    if !keypress_path.exists() {
+        fs::write(&keypress_path, "[System]\r\ncheck_foreground_window = 0\r\n")
+            .map_err(|e| format!("写入 {KEYPRESS_FILE} 失败：{e}"))?;
     }
-    false
+    let active = active_file(efmi_root);
+    if !active.exists() {
+        fs::write(&active, b"; EFMM Persist Bridge disabled\r\n")
+            .map_err(|e| format!("写入 {ACTIVE_FILE} 失败：{e}"))?;
+    }
+    let includer_path = efmi_root.join(BRIDGE_INCLUDE.replace('\\', "/"));
+    if !includer_path.exists() {
+        fs::write(
+            &includer_path,
+            format!("; Generated by Endfield Mod Manager\r\n[IncludeEFMMKeypress]\r\n\
+                     include = {KEYPRESS_FILE}\r\n\r\n[IncludeEFMMPersistActive]\r\n\
+                     include = {ACTIVE_FILE}\r\n"),
+        )
+        .map_err(|e| format!("写入 EFMM 挂载文件失败：{e}"))?;
+    }
+    ensure_d3dx_include(efmi_root)?;
+    Ok(())
 }
 
 pub fn write_bridge_includers(efmi_root: &Path, active_state_files: &[String]) -> Result<(), String> {
-    let qaqm_dir = efmi_root.join("qaqm");
-    let cache_dir = qaqm_dir.join("cache");
-    fs::create_dir_all(&cache_dir).map_err(|e| format!("创建 qaqm/cache 目录失败：{e}"))?;
-
-    let keypress_path = qaqm_dir.join("qaqm_keypress.ini");
-    if !keypress_path.exists() {
-        fs::write(
-            &keypress_path,
-            "[System]\r\ncheck_foreground_window = 0\r\n",
-        )
-        .map_err(|e| format!("写入 qaqm_keypress.ini 失败：{e}"))?;
-    }
-
-    let includer_path = qaqm_dir.join("qaqm_includer.ini");
-    fs::write(
-        &includer_path,
-        "; EFMM Persist Bridge — generated, safe to regenerate\r\n\
-         ; Loads keypress + persist-active so F10 reload works with a non-foreground game window.\r\n\
-         [IncludeKeypress]\r\n\
-         include = qaqm_keypress.ini\r\n\r\n\
-         [IncludePersistBridgeActive]\r\n\
-         include = qaqm_persist_active.ini\r\n",
-    )
-    .map_err(|e| format!("写入 qaqm_includer.ini 失败：{e}"))?;
+    ensure_keypress_files(efmi_root)?;
+    let cache_dir = cache_dir(efmi_root);
+    fs::create_dir_all(&cache_dir).map_err(|e| format!("创建 efmm/cache 目录失败：{e}"))?;
 
     let mut active_buf = String::from("; EFMM Persist Bridge active cache list\r\n");
     let mut seen = HashSet::new();
     for state_name in active_state_files {
         let clean = state_name.trim();
-        if clean.is_empty() || !seen.insert(clean.to_ascii_lowercase()) {
+        if state_file_hash(clean).is_none() || !seen.insert(clean.to_ascii_lowercase()) {
             continue;
         }
         if !cache_dir.join(clean).is_file() {
@@ -174,13 +190,12 @@ pub fn write_bridge_includers(efmi_root: &Path, active_state_files: &[String]) -
         }
         let stem = clean.strip_suffix(".ini").unwrap_or(clean);
         active_buf.push_str(&format!(
-            "[IncludePersistBridge_{stem}]\r\ninclude = cache\\{clean}\r\n\r\n"
+            "[IncludeEFMMPersist_{stem}]\r\ninclude = cache\\{clean}\r\n\r\n"
         ));
     }
 
-    let active_path = qaqm_dir.join("qaqm_persist_active.ini");
-    fs::write(&active_path, active_buf.as_bytes())
-        .map_err(|e| format!("写入 qaqm_persist_active.ini 失败：{e}"))?;
+    fs::write(active_file(efmi_root), active_buf.as_bytes())
+        .map_err(|e| format!("写入 efmm_persist_active.ini 失败：{e}"))?;
 
     Ok(())
 }
@@ -193,13 +208,13 @@ pub fn parse_d3dx_user_values(efmi_root: &Path) -> HashMap<String, String> {
     };
     let raw = String::from_utf8_lossy(&bytes);
     for line in raw.lines() {
-        let trimmed = line.trim();
+        let trimmed = ini_rule(line);
         if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('[') {
             continue;
         }
         if let Some((lhs, rhs)) = trimmed.split_once('=') {
             let k = lhs.trim();
-            if k.starts_with("$\\") {
+            if strip_prefix_ignore_ascii_case(k, "$\\efmm\\persist\\bridge_").is_some() {
                 let val = rhs.split(';').next().unwrap_or("").trim();
                 if !val.is_empty() {
                     map.insert(k.to_ascii_lowercase(), val.to_string());
@@ -238,7 +253,7 @@ fn parse_state_file_values(state_path: &Path) -> Vec<(String, String)> {
 }
 
 fn write_state_file(state_path: &Path, hash12: &str, vars: &[(String, String)]) -> Result<(), String> {
-    let mut buf = format!("namespace = QAQM\\Persist\\Bridge_{hash12}\r\n\r\n[Constants]\r\n");
+    let mut buf = format!("namespace = EFMM\\Persist\\Bridge_{hash12}\r\n\r\n[Constants]\r\n");
     for (name, val) in vars {
         buf.push_str(&format!("global persist ${name} = {val}\r\n"));
     }
@@ -247,7 +262,7 @@ fn write_state_file(state_path: &Path, hash12: &str, vars: &[(String, String)]) 
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    if s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)) {
         Some(&s[prefix.len()..])
     } else {
         None
@@ -290,21 +305,137 @@ fn parse_global_persist_decl(trimmed_line: &str) -> Option<(String, String)> {
 }
 
 fn extract_existing_bridge_hash(content: &str) -> Option<String> {
-    let lower = content.to_ascii_lowercase();
-    for marker in ["\\qaqm\\persist\\bridge_", "qaqm_state_"] {
-        if let Some(pos) = lower.find(marker) {
-            let start = pos + marker.len();
-            let cand: String = lower[start..]
-                .chars()
-                .take(12)
-                .take_while(|c| c.is_ascii_hexdigit())
-                .collect();
-            if cand.len() == 12 {
-                return Some(cand);
+    content.lines().find_map(|line| {
+        let name = line.trim().strip_prefix(OWNED_STATE_MARKER)?;
+        state_file_hash(name).map(str::to_ascii_lowercase)
+    })
+}
+
+fn references_legacy_bridge(content: &str) -> bool {
+    content.lines().any(|line| {
+        let text = line.trim().to_ascii_lowercase();
+        ini_rule(&text).contains("\\qaqm\\persist\\")
+            || text.starts_with("; persisted state is hosted by qaqm_state_")
+    })
+}
+
+fn has_legacy_backup(ini: &Path) -> bool {
+    let mut name = ini.file_name().unwrap_or_default().to_os_string();
+    name.push(".qaqm-persistbak");
+    ini.with_file_name(name).is_file()
+}
+
+fn includes_in_file(path: &Path) -> Vec<String> {
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| include_value(ini_rule(line)))
+            .collect())
+        .unwrap_or_default()
+}
+
+fn legacy_state_is_mounted(efmi_root: &Path) -> bool {
+    includes_in_file(&efmi_root.join("d3dx.ini")).into_iter().any(|include| {
+        match include.as_str() {
+            "qaqm\\qaqm_includer.ini" | "qaqm\\includer.ini" => {
+                let path = efmi_root.join(include.replace('\\', "/"));
+                includes_in_file(&path).iter().any(|child| {
+                    matches!(child.as_str(), "qaqm_persist_active.ini" | "persist_active.ini")
+                        && legacy_active_list_has_states(&efmi_root.join("qaqm").join(child))
+                })
             }
+            "qaqm\\qaqm_persist_active.ini" | "qaqm\\persist_active.ini" => {
+                legacy_active_list_has_states(&efmi_root.join(include.replace('\\', "/")))
+            }
+            _ => false,
         }
+    })
+}
+
+fn legacy_active_list_has_states(path: &Path) -> bool {
+    // The manifest is enough to detect a conflict without opening any old state files.
+    includes_in_file(path)
+        .iter()
+        .any(|entry| entry.starts_with("cache\\") && entry.ends_with(".ini"))
+}
+
+const LEGACY_BRIDGE_MESSAGE: &str = "检测到旧版 Persist Bridge 仍在使用此 Mod 库。请先在原管理器中关闭状态持久化并还原 INI，然后再开启 Endfield Mod Manager 的独立 Persist Bridge。";
+
+fn is_bridge_input_dir(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !name.starts_with("disabled")
+        && !name.starts_with('.')
+        && !name.starts_with("_ps_t_draw_fix_backup_")
+}
+
+fn bridge_files(root: &Path) -> impl Iterator<Item = DirEntry> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if entry.file_type().is_dir() {
+                is_bridge_input_dir(&name)
+            } else {
+                !name.to_ascii_lowercase().starts_with("disabled")
+            }
+        })
+        .flatten()
+        .filter(|entry| entry.file_type().is_file())
+}
+
+fn is_bridge_ini(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".ini") && name != "desktop.ini"
+}
+
+fn collect_bridge_ini_files(mod_dir: &Path) -> Vec<PathBuf> {
+    let mut inis: Vec<_> = bridge_files(mod_dir)
+        .filter(|entry| is_bridge_ini(&entry.file_name().to_string_lossy()))
+        .map(DirEntry::into_path)
+        .collect();
+    inis.sort();
+    inis
+}
+
+fn legacy_bridge_artifact(root: &Path) -> Option<PathBuf> {
+    bridge_files(root)
+        .find(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            name.to_ascii_lowercase().ends_with(".ini.qaqm-persistbak")
+                || (is_bridge_ini(&name)
+                    && fs::read(entry.path()).is_ok_and(|bytes| {
+                        references_legacy_bridge(&String::from_utf8_lossy(&bytes))
+                    }))
+        })
+        .map(DirEntry::into_path)
+}
+
+pub(crate) fn legacy_bridge_conflict(cfg: &AppConfig) -> Option<String> {
+    let efmi_root = efmi_root_from_cfg(cfg).ok()?;
+    if legacy_state_is_mounted(&efmi_root) {
+        return Some(LEGACY_BRIDGE_MESSAGE.to_string());
     }
-    None
+    legacy_bridge_artifact(Path::new(&cfg.mods_path))
+        .map(|path| format!("{LEGACY_BRIDGE_MESSAGE}\n残留文件：{}", path.display()))
+}
+
+pub(crate) fn check_mod_enable(cfg: &AppConfig, mod_dir: &Path) -> Result<(), String> {
+    // The root is still named DISABLED_… during preflight. Its live contents must be checked.
+    let Some(artifact) = legacy_bridge_artifact(mod_dir) else {
+        return Ok(());
+    };
+    if !cfg.persist_bridge_enabled
+        && efmi_root_from_cfg(cfg).is_ok_and(|root| legacy_state_is_mounted(&root))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "此 Mod 仍有旧版 Persist Bridge 改写痕迹，启用前请还原原始 INI 或重新安装原版 Mod。\n残留文件：{}",
+        artifact.display()
+    ))
 }
 
 fn rewrite_code_segment(
@@ -385,6 +516,9 @@ fn rewrite_sibling_ini_references(
         return Ok(());
     };
     let raw = String::from_utf8_lossy(&bytes).into_owned();
+    if references_legacy_bridge(&raw) {
+        return Err(LEGACY_BRIDGE_MESSAGE.to_string());
+    }
     let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
     let ends_with_nl = raw.ends_with('\n');
 
@@ -426,13 +560,7 @@ fn rewrite_sibling_ini_references(
         return Ok(());
     }
 
-    let bak_path = sibling_path.with_file_name(format!(
-        "{}.qaqm-persistbak",
-        sibling_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mod.ini")
-    ));
+    let bak_path = backup_path(sibling_path);
     if !bak_path.exists() {
         fs::write(&bak_path, &bytes)
             .map_err(|e| format!("创建关联 INI 备份失败（{}）：{e}", bak_path.display()))?;
@@ -455,31 +583,30 @@ pub fn bridge_ini_file(
     all_mod_inis: &[PathBuf],
     user_vals: &HashMap<String, String>,
 ) -> Result<Option<String>, String> {
+    if all_mod_inis.iter().any(|path| has_legacy_backup(path)) {
+        return Err(LEGACY_BRIDGE_MESSAGE.to_string());
+    }
     let bytes = fs::read(ini_path).map_err(|e| format!("读取 INI 失败（{}）：{e}", ini_path.display()))?;
     let raw = String::from_utf8_lossy(&bytes).into_owned();
+    if references_legacy_bridge(&raw) {
+        return Err(LEGACY_BRIDGE_MESSAGE.to_string());
+    }
 
-    let cache_dir = efmi_root.join("qaqm").join("cache");
-    fs::create_dir_all(&cache_dir).map_err(|e| format!("创建缓存目录失败：{e}"))?;
+    let cache_dir = cache_dir(efmi_root);
 
-    // If already bridged (either by QAQManager or EFMM), adopt existing hash cleanly
+    // The owner marker distinguishes declarations from references in sibling INIs.
     if let Some(existing_hash) = extract_existing_bridge_hash(&raw) {
-        let state_filename = format!("qaqm_state_{existing_hash}.ini");
+        let state_filename = format!("efmm_state_{existing_hash}.ini");
         let state_path = cache_dir.join(&state_filename);
         if !state_path.is_file() {
-            // Try reconstructing from .qaqm-persistbak if cache file was deleted
-            let bak_path = ini_path.with_file_name(format!(
-                "{}.qaqm-persistbak",
-                ini_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("mod.ini")
-            ));
+            fs::create_dir_all(&cache_dir).map_err(|e| format!("创建缓存目录失败：{e}"))?;
+            let bak_path = backup_path(ini_path);
             if let Ok(bak_raw) = fs::read_to_string(&bak_path) {
                 let mut vars = Vec::new();
                 for l in bak_raw.lines() {
                     if let Some((vname, def_val)) = parse_global_persist_decl(l.trim()) {
                         let key = format!(
-                            "$\\qaqm\\persist\\bridge_{}\\{}",
+                            "$\\efmm\\persist\\bridge_{}\\{}",
                             existing_hash,
                             vname.to_ascii_lowercase()
                         );
@@ -535,12 +662,13 @@ pub fn bridge_ini_file(
         return Ok(None);
     }
 
+    fs::create_dir_all(&cache_dir).map_err(|e| format!("创建缓存目录失败：{e}"))?;
     let hash12 = compute_ini_hash12(mods_root, ini_path);
-    let state_filename = format!("qaqm_state_{hash12}.ini");
+    let state_filename = format!("efmm_state_{hash12}.ini");
     let state_path = cache_dir.join(&state_filename);
-    let target_ns = format!("QAQM\\Persist\\Bridge_{hash12}");
+    let target_ns = format!("EFMM\\Persist\\Bridge_{hash12}");
 
-    // Inherit values priority: d3dx_user bridge key -> d3dx_user orig_ns key -> existing cache file -> ini default
+    // EFMM's game variables and cache take precedence over the original INI defaults.
     let existing_cache_vals: HashMap<String, String> = parse_state_file_values(&state_path)
         .into_iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v))
@@ -550,14 +678,9 @@ pub fn bridge_ini_file(
     let mut var_map_lower: HashMap<String, String> = HashMap::new();
     for (_, vname, def_val) in &decls {
         let vlow = vname.to_ascii_lowercase();
-        let bridge_key = format!("$\\qaqm\\persist\\bridge_{hash12}\\{vlow}");
-        let orig_key = orig_ns
-            .as_ref()
-            .map(|ns| format!("$\\{}\\{vlow}", ns.to_ascii_lowercase()));
-
+        let bridge_key = format!("$\\efmm\\persist\\bridge_{hash12}\\{vlow}");
         let resolved_val = user_vals
             .get(&bridge_key)
-            .or_else(|| orig_key.as_ref().and_then(|k| user_vals.get(k)))
             .or_else(|| existing_cache_vals.get(&vlow))
             .cloned()
             .unwrap_or_else(|| def_val.clone());
@@ -569,13 +692,7 @@ pub fn bridge_ini_file(
     write_state_file(&state_path, &hash12, &state_vars)?;
 
     // Create lossless backup BEFORE rewriting ini
-    let bak_path = ini_path.with_file_name(format!(
-        "{}.qaqm-persistbak",
-        ini_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mod.ini")
-    ));
+    let bak_path = backup_path(ini_path);
     if !bak_path.exists() {
         fs::write(&bak_path, &bytes)
             .map_err(|e| format!("创建原始 INI 备份失败（{}）：{e}", bak_path.display()))?;
@@ -589,7 +706,7 @@ pub fn bridge_ini_file(
     for (idx, line) in lines.into_iter().enumerate() {
         if decl_indices.contains(&idx) {
             if idx == first_decl_idx {
-                new_lines.push(format!("; Persisted state is hosted by {state_filename}"));
+                new_lines.push(format!("{OWNED_STATE_MARKER}{state_filename}"));
             }
             continue;
         }
@@ -643,8 +760,7 @@ fn collect_enabled_mod_dirs(mods_root: &Path) -> Vec<PathBuf> {
         if !char_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let cname = char_entry.file_name().to_string_lossy().to_string();
-        if cname.starts_with('.') {
+        if !is_bridge_input_dir(&char_entry.file_name().to_string_lossy()) {
             continue;
         }
         let Ok(mods) = fs::read_dir(char_entry.path()) else {
@@ -654,8 +770,7 @@ fn collect_enabled_mod_dirs(mods_root: &Path) -> Vec<PathBuf> {
             if !mod_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            let mname = mod_entry.file_name().to_string_lossy().to_string();
-            if mname.starts_with('.') || mname.to_ascii_uppercase().starts_with("DISABLED_") {
+            if !is_bridge_input_dir(&mod_entry.file_name().to_string_lossy()) {
                 continue;
             }
             dirs.push(mod_entry.path());
@@ -673,7 +788,7 @@ fn collect_active_state_files_for_enabled_mods(
     let results: Vec<Result<Vec<String>, String>> = enabled_dirs
         .par_iter()
         .map(|mod_dir| {
-            let inis = collect_ini_files(mod_dir);
+            let inis = collect_bridge_ini_files(mod_dir);
             let mut out = Vec::new();
             for ini in &inis {
                 if let Some(state_file) =
@@ -705,7 +820,7 @@ fn merge_enabled_and_recent(
     recent: &[String],
     cache_size: u32,
 ) -> Vec<String> {
-    let cache_dir = efmi_root.join("qaqm").join("cache");
+    let cache_dir = cache_dir(efmi_root);
     let mut active = Vec::new();
     let mut seen = HashSet::new();
 
@@ -715,7 +830,10 @@ fn merge_enabled_and_recent(
         }
     }
     for s in recent.iter().take(cache_size as usize) {
-        if cache_dir.join(s).is_file() && seen.insert(s.to_ascii_lowercase()) {
+        if state_file_hash(s).is_some()
+            && cache_dir.join(s).is_file()
+            && seen.insert(s.to_ascii_lowercase())
+        {
             active.push(s.clone());
         }
     }
@@ -725,13 +843,16 @@ fn merge_enabled_and_recent(
 pub fn sync_all_enabled_mods(cfg: &mut AppConfig) -> Result<PersistBridgeStatus, String> {
     let efmi_root = efmi_root_from_cfg(cfg)?;
     let mods_root = Path::new(&cfg.mods_path);
-    ensure_d3dx_include(&efmi_root)?;
+    if let Some(conflict) = legacy_bridge_conflict(cfg) {
+        return Err(conflict);
+    }
+    ensure_keypress_files(&efmi_root)?;
 
     let user_vals = parse_d3dx_user_values(&efmi_root);
     let enabled_states = collect_active_state_files_for_enabled_mods(mods_root, &efmi_root, &user_vals)?;
     let enabled_set: HashSet<String> = enabled_states.iter().map(|s| s.to_ascii_lowercase()).collect();
     cfg.persist_bridge_recent
-        .retain(|s| !enabled_set.contains(&s.to_ascii_lowercase()));
+        .retain(|s| state_file_hash(s).is_some() && !enabled_set.contains(&s.to_ascii_lowercase()));
 
     let merged = merge_enabled_and_recent(
         &efmi_root,
@@ -753,38 +874,19 @@ pub fn disable_and_restore_all(cfg: &mut AppConfig) -> Result<PersistBridgeStatu
         .into_iter()
         .flatten()
         .filter(|e| {
-            e.file_type().is_file()
-                && e.file_name()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .ends_with(".ini.qaqm-persistbak")
+            e.file_type().is_file() && is_owned_backup(&e.file_name().to_string_lossy())
         })
         .map(|e| e.into_path())
         .collect();
 
     for bak_path in backups {
-        let fname = bak_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if fname.len() <= ".qaqm-persistbak".len() {
-            continue;
-        }
-        let orig_name = &fname[..fname.len() - ".qaqm-persistbak".len()];
-        let orig_path = bak_path.with_file_name(orig_name);
-        let bytes = fs::read(&bak_path)
-            .map_err(|e| format!("读取备份文件失败（{}）：{e}", bak_path.display()))?;
-        fs::write(&orig_path, &bytes)
-            .map_err(|e| format!("还原原始 INI 失败（{}）：{e}", orig_path.display()))?;
-        let _ = fs::remove_file(&bak_path);
+        restore_owned_backup(&bak_path)?;
     }
 
-    let qaqm_dir = efmi_root.join("qaqm");
-    if qaqm_dir.is_dir() {
-        let _ = fs::write(
-            qaqm_dir.join("qaqm_persist_active.ini"),
-            b"; EFMM Persist Bridge disabled\r\n",
-        );
+    let active = active_file(&efmi_root);
+    if active.is_file() {
+        fs::write(active, b"; EFMM Persist Bridge disabled\r\n")
+            .map_err(|e| format!("关闭 EFMM 状态挂载失败：{e}"))?;
     }
     cfg.persist_bridge_enabled = false;
     cfg.persist_bridge_recent.clear();
@@ -792,8 +894,23 @@ pub fn disable_and_restore_all(cfg: &mut AppConfig) -> Result<PersistBridgeStatu
     Ok(get_status(cfg))
 }
 
+fn restore_owned_backup(backup: &Path) -> Result<(), String> {
+    let fname = backup.file_name().and_then(|s| s.to_str())
+        .ok_or_else(|| format!("无法识别 INI 备份文件名（{}）", backup.display()))?;
+    let orig_path = backup.with_file_name(&fname[..fname.len() - BACKUP_SUFFIX.len()]);
+    if fs::read(&orig_path).is_ok_and(|bytes| references_legacy_bridge(&String::from_utf8_lossy(&bytes))) {
+        return Err(LEGACY_BRIDGE_MESSAGE.to_string());
+    }
+    let bytes = fs::read(backup)
+        .map_err(|e| format!("读取备份文件失败（{}）：{e}", backup.display()))?;
+    fs::write(&orig_path, &bytes)
+        .map_err(|e| format!("还原原始 INI 失败（{}）：{e}", orig_path.display()))?;
+    fs::remove_file(backup)
+        .map_err(|e| format!("删除已还原备份失败（{}）：{e}", backup.display()))
+}
+
 fn find_bridge_hashes_in_mod(mod_dir: &Path) -> Vec<String> {
-    let inis = collect_ini_files(mod_dir);
+    let inis = collect_bridge_ini_files(mod_dir);
     let mut hashes = Vec::new();
     let mut seen = HashSet::new();
     for ini in inis {
@@ -815,20 +932,25 @@ pub fn on_mod_disabled(cfg: &mut AppConfig, mod_dir: &Path) {
     let Ok(efmi_root) = efmi_root_from_cfg(cfg) else {
         return;
     };
+    if legacy_state_is_mounted(&efmi_root)
+        || (!is_d3dx_mounted(&efmi_root) && legacy_bridge_conflict(cfg).is_some())
+    {
+        return;
+    }
     let mods_root = Path::new(&cfg.mods_path);
-    let cache_dir = efmi_root.join("qaqm").join("cache");
+    let cache_dir = cache_dir(&efmi_root);
     let user_vals = parse_d3dx_user_values(&efmi_root);
 
     let hashes = find_bridge_hashes_in_mod(mod_dir);
     for h in hashes {
-        let state_filename = format!("qaqm_state_{h}.ini");
+        let state_filename = format!("efmm_state_{h}.ini");
         let state_path = cache_dir.join(&state_filename);
         if state_path.is_file() {
             let current_vars = parse_state_file_values(&state_path);
             let updated_vars: Vec<(String, String)> = current_vars
                 .into_iter()
                 .map(|(vname, old_val)| {
-                    let key = format!("$\\qaqm\\persist\\bridge_{h}\\{}", vname.to_ascii_lowercase());
+                    let key = format!("$\\efmm\\persist\\bridge_{h}\\{}", vname.to_ascii_lowercase());
                     let next_val = user_vals.get(&key).cloned().unwrap_or(old_val);
                     (vname, next_val)
                 })
@@ -864,11 +986,15 @@ pub fn on_mod_enabled(cfg: &mut AppConfig, mod_dir: &Path) {
     let Ok(efmi_root) = efmi_root_from_cfg(cfg) else {
         return;
     };
+    if legacy_state_is_mounted(&efmi_root)
+        || (!is_d3dx_mounted(&efmi_root) && legacy_bridge_conflict(cfg).is_some())
+    {
+        return;
+    }
     let mods_root = Path::new(&cfg.mods_path);
-    let _ = ensure_d3dx_include(&efmi_root);
     let user_vals = parse_d3dx_user_values(&efmi_root);
 
-    let inis = collect_ini_files(mod_dir);
+    let inis = collect_bridge_ini_files(mod_dir);
     for ini in &inis {
         if let Ok(Some(sf)) = bridge_ini_file(mods_root, &efmi_root, mod_dir, ini, &inis, &user_vals) {
             cfg.persist_bridge_recent
@@ -889,56 +1015,37 @@ pub fn on_mod_enabled(cfg: &mut AppConfig, mod_dir: &Path) {
     }
 }
 
-fn clean_d3dx_user_for_hashes_and_ns(
-    efmi_root: &Path,
-    hashes: &HashSet<String>,
-    namespaces: &HashSet<String>,
-) {
-    if hashes.is_empty() && namespaces.is_empty() {
-        return;
+fn clean_owned_user_values(efmi_root: &Path, hashes: &HashSet<String>) -> Result<bool, String> {
+    if hashes.is_empty() {
+        return Ok(false);
     }
     let user_ini = efmi_root.join("d3dx_user.ini");
-    let Ok(bytes) = fs::read(&user_ini) else {
-        return;
+    let bytes = match fs::read(&user_ini) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("读取 d3dx_user.ini 失败：{error}")),
     };
-    let raw = String::from_utf8_lossy(&bytes).into_owned();
-    let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
-    let ends_with_nl = raw.ends_with('\n');
-
-    let mut lines: Vec<String> = raw
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
-        .collect();
-    if ends_with_nl && lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-        lines.pop();
-    }
-
-    let orig_len = lines.len();
-    lines.retain(|line| {
-        let trimmed = line.trim();
-        if let Some((lhs, _)) = trimmed.split_once('=') {
-            let low = lhs.trim().to_ascii_lowercase();
-            for h in hashes {
-                if low.starts_with(&format!("$\\qaqm\\persist\\bridge_{h}\\")) {
-                    return false;
-                }
-            }
-            for ns in namespaces {
-                if low.starts_with(&format!("$\\{}\\", ns.to_ascii_lowercase())) {
-                    return false;
-                }
-            }
+    let mut out = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        let text = String::from_utf8_lossy(line);
+        let rule = ini_rule(&text);
+        let belongs_to_mod = rule.split_once('=').is_some_and(|(lhs, _)| {
+            let lower = lhs.trim().to_ascii_lowercase();
+            lower.strip_prefix("$\\efmm\\persist\\bridge_")
+                .and_then(|rest| rest.split_once('\\'))
+                .is_some_and(|(hash, _)| hashes.contains(hash))
+        });
+        if !belongs_to_mod {
+            out.extend_from_slice(line);
+        } else if line.starts_with(b"\xef\xbb\xbf") {
+            out.extend_from_slice(b"\xef\xbb\xbf");
         }
-        true
-    });
-
-    if lines.len() != orig_len {
-        let mut out = lines.join(eol);
-        if ends_with_nl {
-            out.push_str(eol);
-        }
-        let _ = fs::write(&user_ini, out.as_bytes());
     }
+    if out.len() == bytes.len() {
+        return Ok(false);
+    }
+    fs::write(&user_ini, out).map_err(|e| format!("写入 d3dx_user.ini 失败：{e}"))?;
+    Ok(true)
 }
 
 pub fn reset_single_mod_dir_ini(
@@ -948,11 +1055,10 @@ pub fn reset_single_mod_dir_ini(
 ) -> Result<usize, String> {
     let efmi_root = efmi_root_from_cfg(cfg)?;
     let mods_root = Path::new(&cfg.mods_path);
-    let cache_dir = efmi_root.join("qaqm").join("cache");
+    let cache_dir = cache_dir(&efmi_root);
 
     let mut count = 0usize;
     let mut hashes_to_clean = HashSet::new();
-    let mut ns_to_clean = HashSet::new();
 
     // Find all backup and ini files directly inside mod_dir
     let mut bak_files = Vec::new();
@@ -962,7 +1068,7 @@ pub fn reset_single_mod_dir_ini(
             continue;
         }
         let fname = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if fname.ends_with(".ini.qaqm-persistbak") {
+        if is_owned_backup(&fname) {
             bak_files.push(entry.into_path());
         } else if fname.ends_with(".ini") && fname != "desktop.ini" {
             ini_files.push(entry.into_path());
@@ -975,34 +1081,16 @@ pub fn reset_single_mod_dir_ini(
             if let Some(h) = extract_existing_bridge_hash(&raw) {
                 hashes_to_clean.insert(h);
             }
-            for line in raw.lines() {
-                if let Some((k, v)) = line.trim().split_once('=') {
-                    if k.trim().eq_ignore_ascii_case("namespace") {
-                        let ns = v.split(';').next().unwrap_or("").trim();
-                        if !ns.is_empty() {
-                            ns_to_clean.insert(ns.to_string());
-                        }
-                    }
-                }
-            }
         }
     }
 
     for bak in bak_files {
-        let fname = bak.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if fname.len() <= ".qaqm-persistbak".len() {
-            continue;
-        }
-        let orig = bak.with_file_name(&fname[..fname.len() - ".qaqm-persistbak".len()]);
-        if let Ok(bytes) = fs::read(&bak) {
-            fs::write(&orig, &bytes).map_err(|e| format!("恢复 INI 失败：{e}"))?;
-            let _ = fs::remove_file(&bak);
-            count += 1;
-        }
+        restore_owned_backup(&bak)?;
+        count += 1;
     }
 
     for h in &hashes_to_clean {
-        let sf = format!("qaqm_state_{h}.ini");
+        let sf = format!("efmm_state_{h}.ini");
         let sp = cache_dir.join(&sf);
         if sp.is_file() {
             let _ = fs::remove_file(&sp);
@@ -1012,12 +1100,12 @@ pub fn reset_single_mod_dir_ini(
             .retain(|s| !s.eq_ignore_ascii_case(&sf));
     }
 
-    clean_d3dx_user_for_hashes_and_ns(&efmi_root, &hashes_to_clean, &ns_to_clean);
+    count += usize::from(clean_owned_user_values(&efmi_root, &hashes_to_clean)?);
 
     // If Persist Bridge is enabled and this mod is enabled, re-bridge fresh from defaults
     if cfg.persist_bridge_enabled && is_enabled {
         on_mod_enabled(cfg, mod_dir);
-    } else if cfg.persist_bridge_enabled {
+    } else if cfg.persist_bridge_enabled && !legacy_state_is_mounted(&efmi_root) {
         let user_vals = parse_d3dx_user_values(&efmi_root);
         if let Ok(enabled_states) =
             collect_active_state_files_for_enabled_mods(mods_root, &efmi_root, &user_vals)
@@ -1033,7 +1121,7 @@ pub fn reset_single_mod_dir_ini(
     }
 
     save_config(cfg)?;
-    Ok(count.max(1))
+    Ok(count)
 }
 
 pub fn reset_mod_ini(
@@ -1070,8 +1158,7 @@ pub fn reset_character_ini(cfg: &mut AppConfig, character_name: &str) -> Result<
 
     let mut total_mods = 0usize;
     for (dir, is_enabled) in dirs {
-        reset_single_mod_dir_ini(cfg, &dir, is_enabled)?;
-        total_mods += 1;
+        total_mods += usize::from(reset_single_mod_dir_ini(cfg, &dir, is_enabled)? > 0);
     }
     Ok(total_mods)
 }
@@ -1079,28 +1166,30 @@ pub fn reset_character_ini(cfg: &mut AppConfig, character_name: &str) -> Result<
 pub fn clear_cache(cfg: &mut AppConfig) -> Result<usize, String> {
     let efmi_root = efmi_root_from_cfg(cfg)?;
     let mods_root = Path::new(&cfg.mods_path);
-    let cache_dir = efmi_root.join("qaqm").join("cache");
-    cfg.persist_bridge_recent.clear();
+    let cache_dir = cache_dir(&efmi_root);
 
     let mut active_set = HashSet::new();
     let user_vals = parse_d3dx_user_values(&efmi_root);
     if cfg.persist_bridge_enabled {
-        if let Ok(enabled_states) =
-            collect_active_state_files_for_enabled_mods(mods_root, &efmi_root, &user_vals)
-        {
-            for sf in &enabled_states {
-                active_set.insert(sf.to_ascii_lowercase());
-            }
-            let _ = write_bridge_includers(&efmi_root, &enabled_states);
+        if let Some(conflict) = legacy_bridge_conflict(cfg) {
+            return Err(conflict);
         }
+        let enabled_states =
+            collect_active_state_files_for_enabled_mods(mods_root, &efmi_root, &user_vals)?;
+        for sf in &enabled_states {
+            active_set.insert(sf.to_ascii_lowercase());
+        }
+        write_bridge_includers(&efmi_root, &enabled_states)?;
     } else {
-        let _ = fs::write(
-            efmi_root.join("qaqm").join("qaqm_persist_active.ini"),
-            b"; EFMM Persist Bridge disabled\r\n",
-        );
+        let active = active_file(&efmi_root);
+        if active.is_file() {
+            fs::write(active, b"; EFMM Persist Bridge disabled\r\n")
+                .map_err(|e| format!("关闭 EFMM 状态挂载失败：{e}"))?;
+        }
     }
 
     let mut removed = 0usize;
+    let mut deleted_hashes = HashSet::new();
     if cache_dir.is_dir() {
         if let Ok(entries) = fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
@@ -1109,8 +1198,9 @@ pub fn clear_cache(cfg: &mut AppConfig) -> Result<usize, String> {
                 }
                 let fname = entry.file_name().to_string_lossy().to_string();
                 let low = fname.to_ascii_lowercase();
-                if low.starts_with("qaqm_state_") && !active_set.contains(&low) {
-                    if fs::remove_file(entry.path()).is_ok() {
+                if let Some(hash) = state_file_hash(&low) {
+                    if !active_set.contains(&low) && fs::remove_file(entry.path()).is_ok() {
+                        deleted_hashes.insert(hash.to_string());
                         removed += 1;
                     }
                 }
@@ -1118,6 +1208,8 @@ pub fn clear_cache(cfg: &mut AppConfig) -> Result<usize, String> {
         }
     }
 
+    clean_owned_user_values(&efmi_root, &deleted_hashes)?;
+    cfg.persist_bridge_recent.clear();
     save_config(cfg)?;
     Ok(removed)
 }
@@ -1126,6 +1218,7 @@ pub fn get_status(cfg: &AppConfig) -> PersistBridgeStatus {
     let Ok(efmi_root) = efmi_root_from_cfg(cfg) else {
         return PersistBridgeStatus {
             enabled: cfg.persist_bridge_enabled,
+            legacy_conflict: false,
             cache_size: cfg.persist_bridge_cache_size,
             d3dx_mounted: false,
             active_state_count: 0,
@@ -1136,44 +1229,43 @@ pub fn get_status(cfg: &AppConfig) -> PersistBridgeStatus {
     let mods_root = Path::new(&cfg.mods_path);
     let d3dx_mounted = is_d3dx_mounted(&efmi_root);
 
-    let active_ini = efmi_root.join("qaqm").join("qaqm_persist_active.ini");
+    let active_ini = active_file(&efmi_root);
     let active_state_count = fs::read_to_string(&active_ini)
         .map(|s| {
             s.lines()
-                .filter(|l| l.trim().to_ascii_lowercase().starts_with("[includepersistbridge_"))
-                .count()
-        })
-        .unwrap_or(0);
-
-    let cache_dir = efmi_root.join("qaqm").join("cache");
-    let cache_file_count = fs::read_dir(&cache_dir)
-        .map(|it| {
-            it.flatten()
-                .filter(|e| {
-                    e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        && e.file_name()
-                            .to_string_lossy()
-                            .to_ascii_lowercase()
-                            .ends_with(".ini")
+                .filter(|line| {
+                    include_value(ini_rule(line)).is_some_and(|path| {
+                        path.strip_prefix("cache\\").is_some_and(|name| state_file_hash(name).is_some())
+                    })
                 })
                 .count()
         })
         .unwrap_or(0);
 
-    let backup_file_count = WalkDir::new(mods_root)
-        .into_iter()
-        .flatten()
-        .filter(|e| {
-            e.file_type().is_file()
-                && e.file_name()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .ends_with(".ini.qaqm-persistbak")
+    let cache_dir = cache_dir(&efmi_root);
+    let cache_file_count = fs::read_dir(&cache_dir)
+        .map(|it| {
+            it.flatten()
+                .filter(|e| {
+                    e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                        && state_file_hash(&e.file_name().to_string_lossy().to_ascii_lowercase()).is_some()
+                })
+                .count()
         })
-        .count();
+        .unwrap_or(0);
+
+    let mut backup_file_count = 0;
+    let legacy_conflict = legacy_bridge_conflict(cfg).is_some();
+    for entry in WalkDir::new(mods_root).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            let name = entry.file_name().to_string_lossy();
+            backup_file_count += usize::from(is_owned_backup(&name));
+        }
+    }
 
     PersistBridgeStatus {
         enabled: cfg.persist_bridge_enabled,
+        legacy_conflict,
         cache_size: cfg.persist_bridge_cache_size,
         d3dx_mounted,
         active_state_count,

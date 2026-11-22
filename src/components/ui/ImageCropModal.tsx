@@ -149,7 +149,7 @@ export function ImageCropModal({
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={() => { if (!saving) onClose(); }}
       title={title}
       subtitle="拖动调整裁剪区域，滚轮或滑条控制缩放"
       maxWidthClass="max-w-xl"
@@ -175,7 +175,7 @@ export function ImageCropModal({
             type="button"
             onClick={handleConfirm}
             disabled={!imageSrc || !croppedAreaPixels || saving}
-            className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-45"
+            className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-fill-hover)] disabled:cursor-not-allowed disabled:opacity-45"
           >
             {saving ? "保存中..." : "保存裁剪"}
           </button>

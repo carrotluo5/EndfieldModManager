@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Copy, Minus, Sparkles, Square, X } from "lucide-react";
+import { Copy, Minus, Square, X } from "lucide-react";
+
+const appIcon = new URL("../../../src-tauri/icons/32x32.png", import.meta.url).href;
 
 export function TitleBar() {
   const [maximized, setMaximized] = useState(false);
@@ -66,9 +68,7 @@ export function TitleBar() {
         data-tauri-drag-region
         className="pointer-events-none flex items-center gap-2 text-xs font-semibold text-[var(--text-primary)]"
       >
-        <span className="flex h-5 w-5 items-center justify-center rounded-md bg-[var(--accent)] text-[var(--accent-contrast)] shadow-sm">
-          <Sparkles className="h-3 w-3" />
-        </span>
+        <img src={appIcon} alt="" className="h-5 w-5 rounded-md" />
         <span className="tracking-tight">Endfield Mod Manager</span>
         <span className="rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-bold tracking-wider text-[var(--accent)]">
           EFMI

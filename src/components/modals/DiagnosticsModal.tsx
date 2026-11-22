@@ -98,7 +98,7 @@ export function DiagnosticsModal({ open, onClose }: DiagnosticsModalProps) {
             type="button"
             onClick={() => void runDiagnostics()}
             disabled={loading || Boolean(fixingId)}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
             <span>{loading ? "体检扫描中..." : "重新执行全面诊断"}</span>
@@ -183,7 +183,7 @@ export function DiagnosticsModal({ open, onClose }: DiagnosticsModalProps) {
                         type="button"
                         disabled={Boolean(fixingId)}
                         onClick={() => void handleFixItem(item.id)}
-                        className="inline-flex items-center gap-1 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-[11px] font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                        className="inline-flex items-center gap-1 rounded-xl bg-[var(--accent-fill)] px-3 py-1.5 text-[11px] font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
                       >
                         <Wrench className="h-3 w-3" />
                         <span>{fixingId === item.id ? "修复中..." : "一键修复"}</span>

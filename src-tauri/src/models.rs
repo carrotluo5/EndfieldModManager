@@ -34,6 +34,9 @@ fn default_true() -> bool {
 fn default_persist_cache_size() -> u32 {
     12
 }
+fn default_update_repo() -> String {
+    "carrotluo5/EndfieldModManager".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +131,14 @@ pub struct AppConfig {
     pub persist_bridge_recent: Vec<String>,
     #[serde(default)]
     pub custom_fixer_path: String,
+    #[serde(default = "default_update_repo")]
+    pub update_repo: String,
+    #[serde(default)]
+    pub update_mirror_prefix: String,
+    #[serde(default)]
+    pub update_github_token: String,
+    #[serde(default)]
+    pub auto_check_updates: bool,
 }
 
 impl Default for AppConfig {
@@ -169,6 +180,10 @@ impl Default for AppConfig {
             persist_bridge_cache_size: default_persist_cache_size(),
             persist_bridge_recent: Vec::new(),
             custom_fixer_path: String::new(),
+            update_repo: default_update_repo(),
+            update_mirror_prefix: String::new(),
+            update_github_token: String::new(),
+            auto_check_updates: false,
         }
     }
 }
@@ -326,15 +341,6 @@ pub struct AutoDetectedPaths {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QaqmImportSummary {
-    pub imported_paths: bool,
-    pub imported_order_count: usize,
-    pub imported_preset_count: usize,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PresetModEntry {
     pub character_name: String,
     pub mod_name: String,
@@ -402,6 +408,7 @@ pub struct ModTagsFile {
 #[serde(rename_all = "camelCase")]
 pub struct PersistBridgeStatus {
     pub enabled: bool,
+    pub legacy_conflict: bool,
     pub cache_size: u32,
     pub d3dx_mounted: bool,
     pub active_state_count: usize,
@@ -536,6 +543,7 @@ pub struct ImportAnalyzedItem {
     pub suggested_character: Option<String>,
     pub match_confidence: String,
     pub suggested_mod_name: String,
+    pub install_disabled: bool,
     pub is_eff_mod: bool,
     pub is_disguised_mp4: bool,
     pub is_large_archive: bool,
@@ -675,5 +683,33 @@ pub struct PackageUpdateResult {
     pub target_kind: String,
     pub copied_files: usize,
     pub skipped_protected_paths: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub has_update: bool,
+    pub can_auto_update: bool,
+    pub min_supported_client_version: String,
+    pub pub_date: String,
+    pub notes: String,
+    pub release_url: String,
+    pub download_url: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub sha256: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProgressEvent {
+    pub stage: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: f64,
     pub message: String,
 }

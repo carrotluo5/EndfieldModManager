@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ImagePlus, Layers, Pencil, Plus, Trash2 } from "lucide-react";
+import { ImagePlus, Layers, Pencil, Plus, Shirt, Trash2 } from "lucide-react";
 import { api, buildMediaUrl } from "../../lib/tauri";
 import { useAppStore } from "../../store/useAppStore";
 import type { AppearanceSection } from "../../types/mod";
@@ -154,26 +154,23 @@ export function AppearanceSectionBar({
 
   return (
     <>
-      <div className="flex items-center gap-2 overflow-x-auto pb-1">
+      <div role="group" aria-label="外观分区" className="flex items-stretch gap-2.5 overflow-x-auto px-0.5 pt-0.5 pb-1">
         <button
           type="button"
           onClick={() => onSelectSection("all")}
-          className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-1.5 text-xs font-medium transition-all ${
+          aria-pressed={selectedSectionId === "all"}
+          className={`flex min-h-14 shrink-0 items-center gap-2.5 rounded-2xl border px-3 py-2 text-left transition-colors ${
             selectedSectionId === "all"
-              ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)] shadow-xs"
+              ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
               : "glass-surface text-[var(--text-primary)] hover:border-[var(--border-strong)]"
           }`}
         >
-          <Layers className="h-3.5 w-3.5 shrink-0" />
-          <span>全部外观</span>
-          <span
-            className={`rounded-full px-1.5 py-0.5 text-[10px] tabular-nums ${
-              selectedSectionId === "all"
-                ? "bg-black/15 text-[var(--accent-contrast)]"
-                : "bg-[var(--bg-elevated)] text-[var(--text-secondary)]"
-            }`}
-          >
-            {totalEnabledCount}/{totalModCount}
+          <Layers className="h-5 w-5 shrink-0" />
+          <span className="grid gap-0.5">
+            <span className="text-sm font-semibold whitespace-nowrap">全部外观</span>
+            <span className="text-xs tabular-nums text-[var(--text-secondary)]">
+              {totalEnabledCount}/{totalModCount} 已启用
+            </span>
           </span>
         </button>
 
@@ -186,29 +183,30 @@ export function AppearanceSectionBar({
               type="button"
               onClick={() => onSelectSection(sec.id)}
               onContextMenu={(e) => handleSectionContextMenu(e, sec)}
+              aria-pressed={active}
               title={sec.isBase ? sec.name : `${sec.name}（右键可编辑或删除）`}
-              className={`flex shrink-0 items-center gap-2 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-all ${
+              className={`flex min-h-14 min-w-30 shrink-0 items-center gap-2.5 rounded-2xl border px-2.5 py-2 text-left transition-colors ${
                 active
-                  ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)] shadow-xs"
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                   : "glass-surface text-[var(--text-primary)] hover:border-[var(--border-strong)]"
               }`}
             >
-              {coverUrl && (
+              {coverUrl ? (
                 <img
                   src={coverUrl}
-                  alt={sec.name}
-                  className="h-5 w-4 shrink-0 rounded object-cover"
+                  alt=""
+                  className="h-10 w-8 shrink-0 rounded-lg object-cover"
                 />
+              ) : (
+                <span className="grid h-10 w-8 shrink-0 place-items-center rounded-lg bg-[var(--bg-elevated)] text-[var(--text-secondary)]">
+                  <Shirt className="h-4 w-4" />
+                </span>
               )}
-              <span className="whitespace-nowrap">{sec.name}</span>
-              <span
-                className={`rounded-full px-1.5 py-0.5 text-[10px] tabular-nums ${
-                  active
-                    ? "bg-black/15 text-[var(--accent-contrast)]"
-                    : "bg-[var(--bg-elevated)] text-[var(--text-secondary)]"
-                }`}
-              >
-                {sec.enabledCount}/{sec.modCount}
+              <span className="grid gap-0.5">
+                <span className="max-w-44 truncate text-sm font-semibold">{sec.name}</span>
+                <span className="text-xs tabular-nums text-[var(--text-secondary)]">
+                  {sec.enabledCount}/{sec.modCount} 已启用
+                </span>
               </span>
             </button>
           );
@@ -217,7 +215,7 @@ export function AppearanceSectionBar({
         <button
           type="button"
           onClick={openCreateModal}
-          className="flex shrink-0 items-center gap-1 rounded-xl border border-dashed border-[var(--border-strong)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent-soft)]"
+          className="flex min-h-14 shrink-0 items-center gap-1.5 rounded-2xl border border-dashed border-[var(--border-strong)] px-3 text-sm font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent-soft)]"
         >
           <Plus className="h-3.5 w-3.5" />
           <span className="whitespace-nowrap">新建分区</span>
@@ -247,7 +245,7 @@ export function AppearanceSectionBar({
               type="button"
               onClick={handleSaveSection}
               disabled={saving}
-              className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
             >
               {saving ? "保存中..." : "保存"}
             </button>

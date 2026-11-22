@@ -8,9 +8,11 @@ import {
   EyeOff,
   FolderOpen,
   Image as ImageIcon,
+  Keyboard,
   Layers,
   LayoutGrid,
   List,
+  LocateFixed,
   Menu,
   Pin,
   Power,
@@ -37,6 +39,8 @@ import type {
   RabbitFxModEntry,
 } from "../types/mod";
 import { ContextMenu, type ContextMenuState } from "../components/ui/ContextMenu";
+import { SelectMenu } from "../components/ui/SelectMenu";
+import { overlayHotkeyFromEvent } from "./hotkey";
 import { applyThemeToDocument, getOverlayPanelBg } from "./themeSync";
 
 type SortMode = "custom" | "enabled" | "name" | "recent";
@@ -49,6 +53,10 @@ export function OverlayApp() {
   const [characters, setCharacters] = useState<CharacterItem[]>([]);
   const [selectedChar, setSelectedChar] = useState<string | null>(null);
   const [showAllChars, setShowAllChars] = useState(false);
+  const selectedCharRef = useRef<string | null>(null);
+  const selectionRequestRef = useRef(0);
+  const modRequestRef = useRef(0);
+  const presetRequestRef = useRef(0);
 
   const [mods, setMods] = useState<ModItem[]>([]);
   const [charAliases, setCharAliases] = useState<string[]>([]);
@@ -57,10 +65,18 @@ export function OverlayApp() {
   const [collapseCollections, setCollapseCollections] = useState(true);
   const [selectedVariants, setSelectedVariants] = useState<Record<string, string>>({});
   const [layout, setLayout] = useState<OverlayLayout>("grid");
+  const modListRef = useRef<HTMLDivElement>(null);
+  const locateIndex = useRef(0);
+  const [locateTarget, setLocateTarget] = useState<{ character: string; mod: string } | null>(null);
 
   const [presets, setPresets] = useState<PresetListResponse | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [hotkeyDraft, setHotkeyDraft] = useState("Alt+F");
+  const [hotkeyDraft, setHotkeyDraft] = useState<string | null>(null);
+  const [recordingHotkey, setRecordingHotkey] = useState(false);
+  const [savingHotkey, setSavingHotkey] = useState(false);
+  const [hotkeyError, setHotkeyError] = useState<string | null>(null);
+  const [cacheSizeDraft, setCacheSizeDraft] = useState<number | null>(null);
+  const [persistBusy, setPersistBusy] = useState(false);
   const [opacityDraft, setOpacityDraft] = useState(90);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
 
@@ -85,66 +101,87 @@ export function OverlayApp() {
   }, []);
 
   const loadModsForChar = useCallback(async (charName: string | null) => {
-    if (!charName) {
-      setMods([]);
-      return;
-    }
+    if (!charName || selectedCharRef.current !== charName) return;
+    const request = ++modRequestRef.current;
     try {
       const res = await api.listMods(charName);
+      if (request !== modRequestRef.current) return;
       setMods(res.mods);
       setCharAliases(res.characterAliases);
       setIsNonCharCategory(res.isNonCharacterCategory);
     } catch {
-      setMods([]);
+      if (request === modRequestRef.current) setMods([]);
+    }
+  }, []);
+
+  const adoptSelectedCharacter = useCallback((charName: string | null) => {
+    if (selectedCharRef.current === charName) return;
+    selectedCharRef.current = charName;
+    modRequestRef.current += 1;
+    setSelectedChar(charName);
+    setMods([]);
+    void loadModsForChar(charName);
+  }, [loadModsForChar]);
+
+  const loadPresets = useCallback(async () => {
+    const request = ++presetRequestRef.current;
+    try {
+      const next = await api.listPresets();
+      if (request === presetRequestRef.current) setPresets(next);
+    } catch {
+      // Keep the last snapshot while the list is unavailable.
     }
   }, []);
 
   const loadBaseData = useCallback(async () => {
     try {
-      const [cfg, ovState, charList, presetRes, runtime] = await Promise.all([
+      const [cfg, ovState, charList, runtime] = await Promise.all([
         api.getConfig(),
         api.getOverlayState(),
-        api.listCharacters(),
-        api.listPresets(),
+        api.listCharacters(true),
         api.getGameRuntimeStatus(),
       ]);
       setConfig(cfg);
       applyThemeToDocument(cfg);
-      setHotkeyDraft(cfg.overlayHotkey || "Alt+F");
       setOpacityDraft(cfg.overlayOpacity ?? 90);
-      setOverlayState(ovState);
+      setOverlayState((current) => current ?? ovState);
       setCharacters(charList);
-      setPresets(presetRes);
       setGameStatus(runtime);
 
       const candidateChar =
         ovState.selectedCharacter && charList.some((c) => c.name === ovState.selectedCharacter)
           ? ovState.selectedCharacter
           : charList.find((c) => c.modCount > 0)?.name ?? charList[0]?.name ?? null;
-      setSelectedChar(candidateChar);
-      if (candidateChar) {
-        await loadModsForChar(candidateChar);
-      }
+      if (selectedCharRef.current === null) adoptSelectedCharacter(candidateChar);
     } catch {
       // Initial mount fallback
     }
-  }, [loadModsForChar]);
+  }, [adoptSelectedCharacter]);
 
   useEffect(() => {
     void loadBaseData();
-  }, [loadBaseData]);
+    void loadPresets();
+  }, [loadBaseData, loadPresets]);
+
+  useEffect(() => {
+    if (!settingsOpen) setRecordingHotkey(false);
+  }, [settingsOpen]);
 
   // Real-time event bus listeners
   useEffect(() => {
     const cleanups: Array<() => void> = [];
     let cancelled = false;
+    let refreshPresetTimer: number | undefined;
+    const refreshPresetStatus = () => {
+      window.clearTimeout(refreshPresetTimer);
+      refreshPresetTimer = window.setTimeout(() => void loadPresets(), 60);
+    };
 
     const setup = async () => {
       const un1 = await listen<AppConfig>("settings-changed", (ev) => {
         if (ev.payload) {
           setConfig(ev.payload);
           applyThemeToDocument(ev.payload);
-          setHotkeyDraft(ev.payload.overlayHotkey);
           setOpacityDraft(ev.payload.overlayOpacity);
         }
       });
@@ -156,40 +193,40 @@ export function OverlayApp() {
         setOverlayState(ev.payload);
         if (ev.payload.visible) {
           void api.getGameRuntimeStatus().then(setGameStatus).catch(() => {});
+        } else {
+          setRecordingHotkey(false);
         }
-        if (ev.payload.selectedCharacter && ev.payload.selectedCharacter !== selectedChar) {
-          setSelectedChar(ev.payload.selectedCharacter);
-          void loadModsForChar(ev.payload.selectedCharacter);
+        if (ev.payload.selectedCharacter) {
+          adoptSelectedCharacter(ev.payload.selectedCharacter);
         }
       });
       if (cancelled) un2();
       else cleanups.push(un2);
 
       const un3 = await listen("characters-changed", () => {
-        void api.listCharacters().then(setCharacters).catch(() => {});
+        void api.listCharacters(true).then(setCharacters).catch(() => {});
       });
       if (cancelled) un3();
       else cleanups.push(un3);
 
       const un4 = await listen("mods-changed", () => {
+        refreshPresetStatus();
         const now = Date.now();
         if (now < optimisticUntilRef.current) {
           if (deferredReloadTimerRef.current) {
             window.clearTimeout(deferredReloadTimerRef.current);
           }
           deferredReloadTimerRef.current = window.setTimeout(() => {
-            void loadModsForChar(selectedChar);
+            void loadModsForChar(selectedCharRef.current);
           }, Math.max(80, optimisticUntilRef.current - now + 40));
           return;
         }
-        void loadModsForChar(selectedChar);
+        void loadModsForChar(selectedCharRef.current);
       });
       if (cancelled) un4();
       else cleanups.push(un4);
 
-      const un5 = await listen("presets-changed", () => {
-        void api.listPresets().then(setPresets).catch(() => {});
-      });
+      const un5 = await listen("presets-changed", refreshPresetStatus);
       if (cancelled) un5();
       else cleanups.push(un5);
     };
@@ -198,29 +235,67 @@ export function OverlayApp() {
     return () => {
       cancelled = true;
       for (const fn of cleanups) fn();
+      window.clearTimeout(refreshPresetTimer);
       if (deferredReloadTimerRef.current) {
         window.clearTimeout(deferredReloadTimerRef.current);
       }
     };
-  }, [selectedChar, loadModsForChar]);
+  }, [adoptSelectedCharacter, loadModsForChar, loadPresets]);
 
   // Layered Escape closing
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      if (ctxMenu) {
-        setCtxMenu(null);
-        return;
-      }
-      if (settingsOpen) {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing || e.repeat || ctxMenu) return;
+      e.preventDefault();
+
+      if (rabbitFxConfirm) {
+        setRabbitFxConfirm(null);
+      } else if (settingsOpen) {
         setSettingsOpen(false);
-        return;
+      } else if (overlayState && overlayState.sideMode !== "closed") {
+        void api.openOverlaySidePanel("closed")
+          .then(setOverlayState)
+          .catch((err) => flashBanner(String(err)));
+      } else {
+        void api.hideOverlay().catch((err) => flashBanner(String(err)));
       }
-      void api.hideOverlay();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [ctxMenu, settingsOpen]);
+  }, [ctxMenu, flashBanner, overlayState, rabbitFxConfirm, settingsOpen]);
+
+  const savedHotkey = config?.overlayHotkey || "Alt+F";
+  const cacheSize = config?.persistBridgeCacheSize ?? 12;
+
+  const saveHotkey = async () => {
+    const next = hotkeyDraft?.trim();
+    if (!next || next === savedHotkey || savingHotkey) return;
+    setRecordingHotkey(false);
+    setSavingHotkey(true);
+    setHotkeyError(null);
+    try {
+      const saved = await api.setOverlayHotkey(next);
+      setConfig((current) => current ? { ...current, overlayHotkey: saved.overlayHotkey } : saved);
+      setHotkeyDraft(null);
+      flashBanner(`呼出快捷键已更新为 ${saved.overlayHotkey}`);
+    } catch (err) {
+      setHotkeyError(String(err));
+    } finally {
+      setSavingHotkey(false);
+    }
+  };
+
+  const runPersistAction = async (action: () => Promise<void>) => {
+    if (persistBusy) return;
+    setPersistBusy(true);
+    try {
+      await action();
+    } catch (err) {
+      flashBanner(String(err));
+    } finally {
+      setPersistBusy(false);
+    }
+  };
 
   const visibleCharacters = useMemo(() => {
     return characters.filter((c) => showAllChars || c.modCount > 0 || c.pinned);
@@ -249,6 +324,55 @@ export function OverlayApp() {
     if (!collapseCollections || !selectedChar) return sortedMods;
     return buildModCollectionView(sortedMods, selectedChar, charAliases, selectedVariants);
   }, [collapseCollections, sortedMods, selectedChar, charAliases, selectedVariants]);
+
+  const enabledMods = sortedMods.filter((mod) => mod.enabled);
+  useEffect(() => { locateIndex.current = 0; }, [selectedChar, sortMode, collapseCollections]);
+
+  useEffect(() => {
+    if (!locateTarget) return;
+    if (locateTarget.character === selectedChar) {
+      const card = Array.from(modListRef.current?.querySelectorAll<HTMLElement>("[data-mod-name]") ?? [])
+        .find((element) => element.dataset.modName === locateTarget.mod);
+      card?.scrollIntoView({ block: "nearest", behavior: (config?.compatLevel ?? 0) >= 2 ? "auto" : "smooth" });
+    }
+    setLocateTarget(null);
+  }, [config?.compatLevel, displayMods, locateTarget, selectedChar]);
+
+  const handleLocateEnabled = () => {
+    const mod = enabledMods[locateIndex.current % enabledMods.length];
+    if (!selectedChar || !mod) return;
+    locateIndex.current += 1;
+    const group = displayMods.find((item) => item.collection?.variants.some((variant) => variant.name === mod.name));
+    const collection = group?.collection;
+    if (collection && group.name !== mod.name) {
+      setSelectedVariants((previous) => ({ ...previous, [collection.identity]: mod.name }));
+    }
+    setLocateTarget({ character: selectedChar, mod: mod.name });
+    void api.openOverlaySidePanel("detail", selectedChar, mod.name).catch((err) => flashBanner(String(err)));
+  };
+
+  const renderVariantPicker = (item: DisplayModItem) => {
+    const collection = item.collection;
+    if (!collection) return null;
+    return (
+      <SelectMenu
+        aria-label="合集变体"
+        size="compact"
+        value={item.name}
+        onChange={(name) => {
+          setSelectedVariants((prev) => ({ ...prev, [collection.identity]: name }));
+          if (overlayState?.sideMode === "detail" && overlayState.selectedModName === item.name) {
+            void api.openOverlaySidePanel("detail", selectedChar, name).catch((err) => flashBanner(String(err)));
+          }
+        }}
+        className="w-full"
+        options={collection.variants.map((variant) => ({
+          value: variant.name,
+          label: getCollectionVariantLabel(variant) + (variant.enabled ? " · 启用" : ""),
+        }))}
+      />
+    );
+  };
 
   const handleToggleMod = async (
     modName: string,
@@ -311,7 +435,7 @@ export function OverlayApp() {
         return;
       }
       if (res.success) {
-        await Promise.all([api.listPresets().then(setPresets), loadModsForChar(selectedChar)]);
+        await loadModsForChar(selectedChar);
         if (config?.overlayPresetAutoReload) {
           void api
             .sendF10Reload()
@@ -327,13 +451,17 @@ export function OverlayApp() {
   };
 
   const handleSelectCharacter = async (charName: string) => {
-    setSelectedChar(charName);
-    await loadModsForChar(charName);
-    void api.openOverlaySidePanel(
-      overlayState?.sideMode === "bubbles" ? "bubbles" : "closed",
-      charName,
-      null
-    );
+    const request = ++selectionRequestRef.current;
+    try {
+      if (overlayState?.sideMode === "detail") await api.openOverlaySidePanel("closed");
+      if (request !== selectionRequestRef.current) return;
+      const snapshot = await api.selectOverlayCharacter(charName);
+      if (request !== selectionRequestRef.current) return;
+      setOverlayState(snapshot);
+      adoptSelectedCharacter(snapshot.selectedCharacter);
+    } catch (err) {
+      if (request === selectionRequestRef.current) flashBanner(String(err));
+    }
   };
 
   const handleCardContextMenu = (e: React.MouseEvent, item: DisplayModItem) => {
@@ -434,7 +562,7 @@ export function OverlayApp() {
             onClick={() => setSettingsOpen((o) => !o)}
             className={`rounded-lg p-1.5 transition-colors ${
               settingsOpen
-                ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                 : "text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
             }`}
           >
@@ -447,7 +575,7 @@ export function OverlayApp() {
             onClick={() => void api.setOverlayPinned(!pinned)}
             className={`rounded-lg p-1.5 transition-colors ${
               pinned
-                ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                 : "text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
             }`}
           >
@@ -496,7 +624,7 @@ export function OverlayApp() {
           }
           className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border transition-colors ${
             overlayState?.sideMode === "bubbles"
-              ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
+              ? "border-[var(--accent)] bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
               : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--accent)]"
           }`}
         >
@@ -536,7 +664,7 @@ export function OverlayApp() {
                 }}
                 className={`flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium whitespace-nowrap transition-colors ${
                   active
-                    ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
+                    ? "border-[var(--accent)] bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                     : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--border-strong)]"
                 }`}
               >
@@ -562,16 +690,18 @@ export function OverlayApp() {
       {/* Controls Strip */}
       <div className="flex items-center justify-between gap-2 border-b border-[var(--border-subtle)] px-3 py-1.5 text-[11px]">
         <div className="flex items-center gap-1.5">
-          <select
+          <SelectMenu<SortMode>
+            aria-label="Mod 排序方式"
+            size="compact"
             value={sortMode}
-            onChange={(e) => setSortMode(e.target.value as SortMode)}
-            className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-2 py-1 text-[11px] text-[var(--text-primary)]"
-          >
-            <option value="custom">自定义</option>
-            <option value="enabled">已启用优先</option>
-            <option value="name">名称</option>
-            <option value="recent">最新</option>
-          </select>
+            onChange={setSortMode}
+            options={[
+              { value: "custom", label: "自定义" },
+              { value: "enabled", label: "已启用优先" },
+              { value: "name", label: "名称" },
+              { value: "recent", label: "最新" },
+            ]}
+          />
 
           <button
             type="button"
@@ -603,6 +733,16 @@ export function OverlayApp() {
           >
             合集
           </button>
+          <button
+            type="button"
+            onClick={handleLocateEnabled}
+            disabled={enabledMods.length === 0}
+            title="依次定位此分类已启用的 Mod"
+            className="inline-flex items-center gap-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-2 py-1 font-medium disabled:opacity-45"
+          >
+            <LocateFixed className="h-3 w-3" />
+            定位
+          </button>
         </div>
 
         <div className="flex items-center rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-0.5">
@@ -612,7 +752,7 @@ export function OverlayApp() {
             onClick={() => setLayout("grid")}
             className={`rounded p-1 ${
               layout === "grid"
-                ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                 : "text-[var(--text-secondary)]"
             }`}
           >
@@ -624,7 +764,7 @@ export function OverlayApp() {
             onClick={() => setLayout("list")}
             className={`rounded p-1 ${
               layout === "list"
-                ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                 : "text-[var(--text-secondary)]"
             }`}
           >
@@ -634,7 +774,7 @@ export function OverlayApp() {
       </div>
 
       {/* Main Mod List / Gallery */}
-      <div className="relative flex-1 overflow-y-auto p-2.5">
+      <div ref={modListRef} className="relative flex-1 overflow-y-auto p-2.5">
         {displayMods.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center text-xs text-[var(--text-muted)]">
             <Layers className="h-7 w-7 opacity-40" />
@@ -648,7 +788,8 @@ export function OverlayApp() {
                 overlayState?.sideMode === "detail" && overlayState?.selectedModName === item.name;
               return (
                 <div
-                  key={item.name}
+                  key={item.collection?.identity ?? item.name}
+                  data-mod-name={item.name}
                   onClick={() =>
                     void api.openOverlaySidePanel("detail", selectedChar, item.name)
                   }
@@ -682,7 +823,7 @@ export function OverlayApp() {
                       }}
                       className={`absolute right-1.5 bottom-1.5 flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold shadow-sm ${
                         item.enabled
-                          ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                          ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                           : "bg-black/65 text-white"
                       }`}
                     >
@@ -695,26 +836,7 @@ export function OverlayApp() {
                     <div className="line-clamp-2 text-[11px] font-semibold leading-snug">
                       {item.collection ? item.collection.name : item.name}
                     </div>
-                    {item.collection && (
-                      <select
-                        value={item.name}
-                        onClick={(e) => e.stopPropagation()}
-                        onChange={(e) => {
-                          setSelectedVariants((prev) => ({
-                            ...prev,
-                            [item.collection!.identity]: e.target.value,
-                          }));
-                        }}
-                        className="w-full rounded border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px]"
-                      >
-                        {item.collection.variants.map((v) => (
-                          <option key={v.name} value={v.name}>
-                            {getCollectionVariantLabel(v)}
-                            {v.enabled ? " · 启用" : ""}
-                          </option>
-                        ))}
-                      </select>
-                    )}
+                    {renderVariantPicker(item)}
                   </div>
                 </div>
               );
@@ -727,7 +849,8 @@ export function OverlayApp() {
                 overlayState?.sideMode === "detail" && overlayState?.selectedModName === item.name;
               return (
                 <div
-                  key={item.name}
+                  key={item.collection?.identity ?? item.name}
+                  data-mod-name={item.name}
                   onClick={() =>
                     void api.openOverlaySidePanel("detail", selectedChar, item.name)
                   }
@@ -738,9 +861,10 @@ export function OverlayApp() {
                       : "border-[var(--border-subtle)] bg-[var(--bg-surface)] hover:border-[var(--border-strong)]"
                   }`}
                 >
-                  <span className="truncate font-medium">
-                    {item.collection ? item.collection.name : item.name}
-                  </span>
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="truncate font-medium">{item.collection?.name ?? item.name}</div>
+                    {renderVariantPicker(item)}
+                  </div>
                   <button
                     type="button"
                     onClick={(e) => {
@@ -749,7 +873,7 @@ export function OverlayApp() {
                     }}
                     className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${
                       item.enabled
-                        ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                        ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                         : "bg-[var(--bg-elevated)] text-[var(--text-secondary)]"
                     }`}
                   >
@@ -792,33 +916,74 @@ export function OverlayApp() {
                 />
               </label>
 
-              <div className="space-y-1">
-                <label className="block text-[11px] text-[var(--text-secondary)]">
+              <form
+                className="space-y-1"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void saveHotkey();
+                }}
+              >
+                <label htmlFor="overlay-hotkey" className="block text-[11px] text-[var(--text-secondary)]">
                   全局呼出快捷键
                 </label>
                 <div className="flex gap-1.5">
                   <input
+                    id="overlay-hotkey"
                     type="text"
-                    value={hotkeyDraft}
-                    onChange={(e) => setHotkeyDraft(e.target.value)}
-                    className="flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2.5 py-1.5 font-mono text-xs"
+                    value={hotkeyDraft ?? savedHotkey}
+                    onChange={(e) => {
+                      setHotkeyDraft(e.target.value);
+                      setHotkeyError(null);
+                    }}
+                    spellCheck={false}
+                    disabled={!config || savingHotkey}
+                    className="min-w-0 flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2.5 py-1.5 font-mono text-xs"
                   />
                   <button
                     type="button"
-                    onClick={async () => {
-                      try {
-                        await api.setOverlayHotkey(hotkeyDraft);
-                        flashBanner(`呼出快捷键已更新为 ${hotkeyDraft}`);
-                      } catch (err) {
-                        flashBanner(String(err));
-                      }
+                    onClick={(e) => {
+                      e.currentTarget.focus({ preventScroll: true });
+                      setRecordingHotkey((recording) => !recording);
                     }}
-                    className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[11px] font-semibold text-[var(--accent-contrast)]"
+                    onBlur={() => setRecordingHotkey(false)}
+                    onKeyDown={(e) => {
+                      if (!recordingHotkey || (e.key === "Tab" && !e.ctrlKey && !e.altKey)) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (e.key === "Escape") {
+                        setRecordingHotkey(false);
+                        return;
+                      }
+                      const captured = overlayHotkeyFromEvent(e.nativeEvent);
+                      if (!captured) return;
+                      setHotkeyDraft(captured);
+                      setHotkeyError(null);
+                      setRecordingHotkey(false);
+                    }}
+                    aria-pressed={recordingHotkey}
+                    disabled={!config || savingHotkey}
+                    className="flex shrink-0 items-center gap-1 rounded-lg border border-[var(--border-subtle)] px-2 py-1.5 text-[11px] aria-pressed:border-[var(--accent)] aria-pressed:bg-[var(--accent-soft)] disabled:opacity-45"
                   >
-                    应用
+                    <Keyboard className="h-3.5 w-3.5" />
+                    {recordingHotkey ? "录制中" : "录制"}
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!config || savingHotkey || !hotkeyDraft?.trim() || hotkeyDraft.trim() === savedHotkey}
+                    className="shrink-0 rounded-lg bg-[var(--accent-fill)] px-3 py-1.5 text-[11px] font-semibold text-[var(--accent-contrast)] disabled:opacity-45"
+                  >
+                    {savingHotkey ? "保存中" : "应用"}
                   </button>
                 </div>
-              </div>
+                {recordingHotkey && (
+                  <p role="status" className="text-[11px] text-[var(--text-secondary)]">
+                    按下新快捷键，按 Esc 取消录制。
+                  </p>
+                )}
+                {hotkeyError && (
+                  <p role="alert" className="break-words text-[11px] text-[var(--danger)]">{hotkeyError}</p>
+                )}
+              </form>
 
               {(
                 [
@@ -862,14 +1027,15 @@ export function OverlayApp() {
                 <span>Persist Bridge 状态桥接</span>
                 <button
                   type="button"
-                  onClick={async () => {
+                  onClick={() => void runPersistAction(async () => {
                     const next = !(config?.persistBridgeEnabled ?? false);
                     await api.setPersistBridgeEnabled(next);
                     flashBanner(next ? "已开启 Persist Bridge" : "已关闭并还原 INI 备份");
-                  }}
-                  className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
+                  })}
+                  disabled={persistBusy || !config?.modsPath.trim()}
+                  className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold disabled:opacity-45 ${
                     config?.persistBridgeEnabled
-                      ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                      ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                       : "bg-[var(--bg-surface)] text-[var(--text-secondary)]"
                   }`}
                 >
@@ -877,13 +1043,51 @@ export function OverlayApp() {
                 </button>
               </div>
 
+              <div className="space-y-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2">
+                <label htmlFor="overlay-persist-cache" className="flex justify-between gap-2">
+                  <span>最近禁用缓存槽位</span>
+                  <span className="font-semibold tabular-nums">{cacheSizeDraft ?? cacheSize} 个</span>
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="overlay-persist-cache"
+                    type="range"
+                    min={0}
+                    max={30}
+                    step={1}
+                    value={cacheSizeDraft ?? cacheSize}
+                    onChange={(e) => setCacheSizeDraft(Number(e.target.value))}
+                    disabled={!config || persistBusy}
+                    className="min-w-0 flex-1 accent-[var(--accent)]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void runPersistAction(async () => {
+                      if (cacheSizeDraft === null) return;
+                      const status = await api.setPersistBridgeCacheSize(cacheSizeDraft);
+                      setConfig((current) => current ? { ...current, persistBridgeCacheSize: status.cacheSize } : current);
+                      setCacheSizeDraft(null);
+                      flashBanner(`最近禁用缓存槽位已设为 ${status.cacheSize} 个`);
+                    })}
+                    disabled={!config || persistBusy || cacheSizeDraft === null || cacheSizeDraft === cacheSize}
+                    className="shrink-0 rounded-lg border border-[var(--border-subtle)] px-2 py-1 text-[11px] font-semibold disabled:opacity-45"
+                  >
+                    应用
+                  </button>
+                </div>
+                <p className="text-[11px] text-[var(--text-secondary)]">
+                  设为 0 时仅保留当前启用 Mod 的状态。
+                </p>
+              </div>
+
               <button
                 type="button"
-                onClick={async () => {
+                onClick={() => void runPersistAction(async () => {
                   const removed = await api.clearPersistBridgeCache();
                   flashBanner(`已清理 ${removed} 个未用缓存文件`);
-                }}
-                className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] py-2 text-xs text-[var(--text-secondary)] hover:border-[var(--danger)] hover:text-[var(--danger)]"
+                })}
+                disabled={persistBusy || !config?.modsPath.trim()}
+                className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] py-2 text-xs text-[var(--text-secondary)] hover:border-[var(--danger)] hover:text-[var(--danger)] disabled:opacity-45"
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 <span>清理未使用 Persist 缓存</span>
@@ -895,7 +1099,7 @@ export function OverlayApp() {
 
       {/* Status Toast Banner */}
       {statusBanner && (
-        <div className="border-t border-[var(--border-subtle)] bg-[var(--accent-soft)] px-3 py-1 text-center text-[11px] font-medium text-[var(--accent)]">
+        <div role="status" className="border-t border-[var(--border-subtle)] bg-[var(--accent-soft)] px-3 py-1 text-center text-[11px] font-medium text-[var(--accent)]">
           {statusBanner}
         </div>
       )}
@@ -912,7 +1116,7 @@ export function OverlayApp() {
           onClick={() => void handleApplyPreset("__builtin_no_mod__")}
           className={`shrink-0 rounded-lg border px-2.5 py-1 text-[11px] font-medium whitespace-nowrap ${
             presets?.builtinNoModActive
-              ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
+              ? "border-[var(--accent)] bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
               : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]"
           }`}
         >
@@ -928,7 +1132,7 @@ export function OverlayApp() {
               onClick={() => void handleApplyPreset(p.id)}
               className={`shrink-0 rounded-lg border px-2.5 py-1 text-[11px] font-medium whitespace-nowrap ${
                 active
-                  ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
+                  ? "border-[var(--accent)] bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                   : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--border-strong)]"
               }`}
             >
@@ -977,7 +1181,7 @@ export function OverlayApp() {
                     void handleApplyPreset(pending.presetId, true);
                   }
                 }}
-                className="rounded-lg bg-[var(--accent)] px-3 py-1.5 font-semibold text-[var(--accent-contrast)]"
+                className="rounded-lg bg-[var(--accent-fill)] px-3 py-1.5 font-semibold text-[var(--accent-contrast)]"
               >
                 替换并继续
               </button>

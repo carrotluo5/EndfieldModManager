@@ -7,7 +7,6 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
-  HardDriveDownload,
   Layers,
   Pencil,
   Play,
@@ -36,6 +35,7 @@ const BUILTIN_NO_MOD_ID = "__builtin_no_mod__";
 export function PresetView() {
   const config = useAppStore((s) => s.config);
   const presetsTick = useAppStore((s) => s.presetsTick);
+  const modsTick = useAppStore((s) => s.modsTick);
   const undoStack = useAppStore((s) => s.undoStack);
   const refreshPresetCount = useAppStore((s) => s.refreshPresetCount);
   const refreshRabbitFxStatus = useAppStore((s) => s.refreshRabbitFxStatus);
@@ -49,7 +49,6 @@ export function PresetView() {
   const [loading, setLoading] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [applyingId, setApplyingId] = useState<string | null>(null);
-  const [importingQaqm, setImportingQaqm] = useState(false);
   const [undoing, setUndoing] = useState(false);
 
   // Create / Visual Editor Modal
@@ -86,7 +85,7 @@ export function PresetView() {
 
   useEffect(() => {
     void loadPresets();
-  }, [loadPresets, presetsTick, config?.modsPath]);
+  }, [loadPresets, presetsTick, modsTick, config?.modsPath]);
 
   const makeEntryKey = (charName: string, modName: string) => `${charName}\0${modName}`;
 
@@ -236,7 +235,7 @@ export function PresetView() {
   const handleImportJson = async () => {
     try {
       const picked = await openDialog({
-        title: "导入预设 JSON（兼容 QAQManager presets.json）",
+        title: "导入 Endfield Mod Manager 预设",
         multiple: false,
         filters: [{ name: "JSON 文件", extensions: ["json"] }],
       });
@@ -267,24 +266,6 @@ export function PresetView() {
       addToast("success", `已导出 ${count} 个预设到文件`);
     } catch (err) {
       addToast("error", String(err));
-    }
-  };
-
-  const handleImportQaqm = async () => {
-    setImportingQaqm(true);
-    try {
-      const summary = await api.importFromQaqmanager();
-      await refreshPresetCount();
-      bumpPresetsTick();
-      if (summary.importedPresetCount > 0) {
-        addToast("success", `成功迁移 ${summary.importedPresetCount} 个 QAQManager 预设`);
-      } else {
-        addToast("info", summary.warnings[0] || "未发现新的可迁移预设");
-      }
-    } catch (err) {
-      addToast("error", String(err));
-    } finally {
-      setImportingQaqm(false);
     }
   };
 
@@ -331,8 +312,7 @@ export function PresetView() {
       .map(([, v]) => v);
   }, [catalog, selectedMap]);
 
-  const builtinActive =
-    Boolean(presetList?.builtinNoModActive) || presetList?.activePresetId === BUILTIN_NO_MOD_ID;
+  const builtinActive = Boolean(presetList?.builtinNoModActive);
 
   return (
     <div className="h-full overflow-y-auto px-6 py-5">
@@ -362,16 +342,6 @@ export function PresetView() {
 
             <button
               type="button"
-              onClick={() => void handleImportQaqm()}
-              disabled={importingQaqm}
-              className="glass-surface inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium text-[var(--text-primary)] hover:border-[var(--border-strong)] disabled:opacity-50"
-            >
-              <HardDriveDownload className="h-3.5 w-3.5" />
-              <span>{importingQaqm ? "迁移中..." : "QAQ 迁移"}</span>
-            </button>
-
-            <button
-              type="button"
               onClick={() => void handleImportJson()}
               className="glass-surface inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium text-[var(--text-primary)] hover:border-[var(--border-strong)]"
             >
@@ -393,7 +363,7 @@ export function PresetView() {
               type="button"
               onClick={() => void openCreateModal()}
               disabled={!config?.modsPath.trim()}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-45"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-45"
             >
               <Plus className="h-3.5 w-3.5" />
               <span>新建预设</span>
@@ -438,7 +408,7 @@ export function PresetView() {
             type="button"
             onClick={() => void handleApplyPreset(BUILTIN_NO_MOD_ID)}
             disabled={applyingId === BUILTIN_NO_MOD_ID || !config?.modsPath.trim()}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-4 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)] disabled:opacity-45"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-4 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent-fill)] hover:text-[var(--accent-contrast)] disabled:opacity-45"
           >
             <Play className="h-3.5 w-3.5 fill-current" />
             <span>{applyingId === BUILTIN_NO_MOD_ID ? "应用中..." : "一键停用全部"}</span>
@@ -531,7 +501,7 @@ export function PresetView() {
                         type="button"
                         onClick={() => void handleApplyPreset(preset.id)}
                         disabled={applyingId === preset.id || !config?.modsPath.trim()}
-                        className="inline-flex items-center gap-1 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                        className="inline-flex items-center gap-1 rounded-xl bg-[var(--accent-fill)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
                       >
                         <Play className="h-3 w-3 fill-current" />
                         <span>{applyingId === preset.id ? "应用中..." : "应用"}</span>
@@ -620,7 +590,7 @@ export function PresetView() {
               暂无自定义 Mod 预设
             </div>
             <p className="mt-1 text-xs text-[var(--text-secondary)]">
-              点击右上角「新建预设」可一键快照当前装扮，或通过「QAQ 迁移 / 导入 JSON」载入历史方案。
+              点击「新建预设」保存当前装扮，或通过「导入 JSON」载入备份的预设。
             </p>
           </div>
         )}
@@ -650,7 +620,7 @@ export function PresetView() {
               type="button"
               onClick={() => void handleSaveEditor()}
               disabled={savingEditor}
-              className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
             >
               {savingEditor ? "保存中..." : "保存预设"}
             </button>
@@ -701,7 +671,7 @@ export function PresetView() {
               <button
                 type="button"
                 onClick={handleSnapshotIntoEditor}
-                className="inline-flex items-center gap-1 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3 py-1.5 font-medium text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
+                className="inline-flex items-center gap-1 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3 py-1.5 font-medium text-[var(--accent)] hover:bg-[var(--accent-fill)] hover:text-[var(--accent-contrast)]"
               >
                 <Sparkles className="h-3.5 w-3.5" />
                 <span>快照当前已启用</span>

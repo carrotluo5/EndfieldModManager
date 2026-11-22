@@ -5,7 +5,7 @@ use crate::mods::resolve_mod_dir;
 use crate::persist_bridge;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,12 +54,24 @@ pub fn create_mod_ini_backup(
     if inis.is_empty() {
         return Ok(None);
     }
-    let nanos = SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let backup_id = format!("bak_{nanos}");
-    let bak_root = mod_dir.join(BACKUPS_DIR_NAME).join(&backup_id);
+    let backups_parent = mod_dir.join(BACKUPS_DIR_NAME);
+    let mut suffix = 0usize;
+    let (backup_id, bak_root) = loop {
+        let cand_id = if suffix == 0 {
+            format!("bak_{millis}")
+        } else {
+            format!("bak_{millis}_{suffix}")
+        };
+        let cand_root = backups_parent.join(&cand_id);
+        if !cand_root.exists() {
+            break (cand_id, cand_root);
+        }
+        suffix += 1;
+    };
     fs::create_dir_all(&bak_root).map_err(|e| format!("创建修复备份目录失败：{e}"))?;
 
     let mut copied = 0usize;
@@ -116,7 +128,7 @@ pub fn list_mod_fix_backups(
         let meta_path = entry.path().join("meta.json");
         let meta = fs::read_to_string(&meta_path)
             .ok()
-            .and_then(|s| serde_json::from_str::<BackupMeta>(&s).ok())
+            .and_then(|s| serde_json::from_str::<BackupMeta>(s.trim_start_matches('\u{feff}')).ok())
             .unwrap_or_else(|| BackupMeta {
                 created_at: String::new(),
                 fixer_name: "未知工具".to_string(),
@@ -315,23 +327,48 @@ fn run_external_fixer_exe(exe_path: &Path, work_dir: &Path) -> Result<String, St
         let _ = stdin.write_all(b"\n\n");
     }
 
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => {
-                let output = child.wait_with_output().map_err(|e| e.to_string())?;
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let out_bytes = out_handle.join().unwrap_or_default();
+                let err_bytes = err_handle.join().unwrap_or_default();
+                let stdout = String::from_utf8_lossy(&out_bytes);
+                let stderr = String::from_utf8_lossy(&err_bytes);
                 return Ok(format!("{} {}", stdout.trim(), stderr.trim()).trim().to_string());
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
+                    let _ = child.wait();
+                    drop(out_handle);
+                    drop(err_handle);
                     return Err("外部修复器执行超时（超过 20 秒），已安全终止；如需查看交互提示请直接双击该工具".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(80));
             }
-            Err(e) => return Err(format!("等待修复器退出失败：{e}")),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("等待修复器退出失败：{e}"));
+            }
         }
     }
 }

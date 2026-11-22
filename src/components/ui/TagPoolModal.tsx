@@ -80,7 +80,7 @@ export function TagPoolModal({ open, tags, onClose, onSave }: TagPoolModalProps)
             type="button"
             onClick={() => void handleSave()}
             disabled={saving}
-            className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+            className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
           >
             {saving ? "保存中..." : "保存标签池"}
           </button>
@@ -109,7 +109,7 @@ export function TagPoolModal({ open, tags, onClose, onSave }: TagPoolModalProps)
           <button
             type="button"
             onClick={handleAdd}
-            className="inline-flex items-center gap-1 rounded-lg bg-[var(--accent)] px-3 py-1.5 font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+            className="inline-flex items-center gap-1 rounded-lg bg-[var(--accent-fill)] px-3 py-1.5 font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
           >
             <Plus className="h-3.5 w-3.5" />
             <span>添加</span>

@@ -17,9 +17,9 @@ const THEME_PRESETS: Array<{
     id: "rose-light",
     name: "樱粉浅色",
     desc: "柔和明亮 · 默认轻透玻璃感",
-    previewBg: "#fdf5f6",
+    previewBg: "#fbf8f9",
     previewCard: "#ffffff",
-    previewAccent: "#ec4899",
+    previewAccent: "#efd0dc",
     dark: false,
   },
   {
@@ -52,7 +52,7 @@ const THEME_PRESETS: Array<{
 ];
 
 const ACCENT_SWATCHES = [
-  "#ec4899",
+  "#d9a4b9",
   "#f43f5e",
   "#facc15",
   "#10b981",
@@ -205,7 +205,7 @@ export function PersonalizationView() {
               <span>自定义取色</span>
               <input
                 type="color"
-                value={config.customAccent || "#ec4899"}
+                value={config.customAccent || THEME_PRESETS.find(({ id }) => id === config.theme)?.previewAccent || "#efd0dc"}
                 onChange={(e) => updateConfigPatch({ customAccent: e.target.value })}
                 className="h-5 w-7 cursor-pointer border-0 bg-transparent p-0"
               />
@@ -235,7 +235,7 @@ export function PersonalizationView() {
               <button
                 type="button"
                 onClick={handleAddLocalBg}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
               >
                 <ImagePlus className="h-3.5 w-3.5" />
                 <span>添加本地图片</span>
@@ -266,7 +266,7 @@ export function PersonalizationView() {
                       />
                     )}
                     {active && (
-                      <span className="absolute top-1.5 left-1.5 rounded-md bg-[var(--accent)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-contrast)]">
+                      <span className="absolute top-1.5 left-1.5 rounded-md bg-[var(--accent-fill)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-contrast)]">
                         当前使用
                       </span>
                     )}

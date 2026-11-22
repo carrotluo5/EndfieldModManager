@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ShieldCheck, UploadCloud } from "lucide-react";
@@ -19,19 +19,19 @@ import { PersonalizationView } from "./components/views/PersonalizationView";
 import { PresetView } from "./components/views/PresetView";
 import { SettingsView } from "./components/views/SettingsView";
 import { createPreblurredBackgroundUrl } from "./lib/bgPreblur";
-import { buildMediaUrl } from "./lib/tauri";
+import { api, buildMediaUrl } from "./lib/tauri";
+import { applyThemeToDocument } from "./overlay/themeSync";
 import { useAppStore } from "./store/useAppStore";
 import type { AppConfig, NavigateToModPayload } from "./types/mod";
 
 const EMPTY_IMPORT_PATHS: string[] = [];
+const IMAGE_FILE = /\.(png|jpe?g|webp|gif|bmp)$/i;
 
-function hexToRgba(hex: string, alpha: number): string | null {
-  const cleaned = hex.trim().replace(/^#/, "");
-  if (!/^[0-9a-fA-F]{6}$/.test(cleaned)) return null;
-  const r = parseInt(cleaned.slice(0, 2), 16);
-  const g = parseInt(cleaned.slice(2, 4), 16);
-  const b = parseInt(cleaned.slice(4, 6), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+function imageDropAt({ x, y }: { x: number; y: number }) {
+  const scale = window.devicePixelRatio || 1;
+  return document
+    .elementFromPoint(x / scale, y / scale)
+    ?.closest<HTMLElement>("[data-preview-drop-target], [data-cover-drop-target]")?.dataset;
 }
 
 export function App() {
@@ -63,6 +63,10 @@ export function App() {
   const refreshRabbitFxStatus = useAppStore((s) => s.refreshRabbitFxStatus);
 
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [previewDropTarget, setPreviewDropTarget] = useState<string | null>(null);
+  const [coverDropTarget, setCoverDropTarget] = useState<string | null>(null);
+  const [droppedCover, setDroppedCover] = useState<{ name: string; path: string } | null>(null);
+  const clearDroppedCover = useCallback(() => setDroppedCover(null), []);
   const [preblurredBgUrl, setPreblurredBgUrl] = useState<string | null>(null);
   const activeBlobUrlRef = useRef<string | null>(null);
 
@@ -154,28 +158,31 @@ export function App() {
 
   // Apply theme tokens, compatibility mode, sidebar zoom & custom accent dynamically
   useEffect(() => {
-    const root = document.documentElement;
-    if (!config) {
-      root.dataset.theme = "rose-light";
-      root.dataset.compatLevel = "0";
+    applyThemeToDocument(config);
+    document.documentElement.style.setProperty("--sidebar-zoom", String((config?.sidebarZoom || 100) / 100));
+  }, [config]);
+
+  const autoUpdateCheckedRef = useRef(false);
+  useEffect(() => {
+    if (!config || !config.autoCheckUpdates || autoUpdateCheckedRef.current) {
       return;
     }
-
-    root.dataset.theme = config.theme || "rose-light";
-    root.dataset.compatLevel = String(config.compatLevel ?? 0);
-    root.style.setProperty("--sidebar-zoom", String((config.sidebarZoom || 100) / 100));
-
-    const accent = config.customAccent?.trim();
-    if (accent) {
-      root.style.setProperty("--accent", accent);
-      root.style.setProperty("--accent-hover", accent);
-      const soft = hexToRgba(accent, 0.16);
-      if (soft) root.style.setProperty("--accent-soft", soft);
-    } else {
-      root.style.removeProperty("--accent");
-      root.style.removeProperty("--accent-hover");
-      root.style.removeProperty("--accent-soft");
-    }
+    autoUpdateCheckedRef.current = true;
+    const timer = window.setTimeout(() => {
+      void api
+        .checkForUpdates()
+        .then((res) => {
+          if (res.hasUpdate) {
+            useAppStore
+              .getState()
+              .addToast("info", `发现新版本 v${res.latestVersion}，可前往「设置 -> 软件更新」一键升级`);
+          }
+        })
+        .catch(() => {
+          // Silent on background startup check
+        });
+    }, 3000);
+    return () => window.clearTimeout(timer);
   }, [config]);
 
   const bgImageUrl = config?.activeBgImage ? buildMediaUrl(config.activeBgImage) : null;
@@ -234,23 +241,49 @@ export function App() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let cancelled = false;
+    let draggingImage = false;
 
     const registerDrop = async () => {
       try {
         const fn = await getCurrentWebview().onDragDropEvent((event) => {
           const payload = event.payload;
           if (payload.type === "enter" || payload.type === "over") {
-            setIsDraggingFiles(true);
+            if (payload.type === "enter") {
+              draggingImage = payload.paths.length === 1 && IMAGE_FILE.test(payload.paths[0]);
+            }
+            const target = draggingImage ? imageDropAt(payload.position) : undefined;
+            setPreviewDropTarget(target?.previewDropTarget ?? null);
+            setCoverDropTarget(target?.coverDropTarget ?? null);
+            setIsDraggingFiles(!target && !document.querySelector('[aria-modal="true"]'));
           } else if (payload.type === "leave") {
+            draggingImage = false;
             setIsDraggingFiles(false);
+            setPreviewDropTarget(null);
+            setCoverDropTarget(null);
           } else if (payload.type === "drop") {
+            draggingImage = false;
             setIsDraggingFiles(false);
+            setPreviewDropTarget(null);
+            setCoverDropTarget(null);
+            if (document.querySelector('[aria-modal="true"]')) return;
             if (payload.paths && payload.paths.length > 0) {
               const st = useAppStore.getState();
-              st.openImportWizard(
-                payload.paths,
-                st.activeTab === "characters" ? st.selectedCharacter : null
-              );
+              const character = st.activeTab === "characters" ? st.selectedCharacter : null;
+              const file = payload.paths[0];
+              const target = payload.paths.length === 1 && IMAGE_FILE.test(file)
+                ? imageDropAt(payload.position) : undefined;
+              if (character && target?.previewDropTarget) {
+                void api.setModPreviewFile(character, target.previewDropTarget, file).then(() => {
+                  st.bumpModsTick();
+                  st.addToast("success", "已更换 Mod 预览图");
+                }).catch((err) => st.addToast("error", String(err)));
+                return;
+              }
+              if (!character && target?.coverDropTarget && !st.movingMod) {
+                setDroppedCover({ name: target.coverDropTarget, path: file });
+                return;
+              }
+              st.openImportWizard(payload.paths, character);
             }
           }
         });
@@ -325,9 +358,13 @@ export function App() {
             >
               {activeTab === "characters" &&
                 (selectedCharacter ? (
-                  <ModView characterName={selectedCharacter} />
+                  <ModView characterName={selectedCharacter} previewDropTarget={previewDropTarget} />
                 ) : (
-                  <CharactersView />
+                  <CharactersView
+                    coverDropTarget={coverDropTarget}
+                    droppedCover={droppedCover}
+                    clearDroppedCover={clearDroppedCover}
+                  />
                 ))}
               {activeTab === "presets" && <PresetView />}
               {activeTab === "personalization" && <PersonalizationView />}
@@ -386,14 +423,14 @@ export function App() {
                 void updateConfigPatch({ disclaimerDismissed: true });
                 setSetupWizardOpen(true);
               }}
-              className="rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-4 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
+              className="rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-4 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent-fill)] hover:text-[var(--accent-contrast)]"
             >
               进入 4 步初始化向导
             </button>
             <button
               type="button"
               onClick={() => void updateConfigPatch({ disclaimerDismissed: true })}
-              className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+              className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
             >
               我已了解，开始使用
             </button>
@@ -410,7 +447,7 @@ export function App() {
           <ul className="list-inside list-disc space-y-1.5">
             <li>本工具仅管理本地 EFMI / XXMI 的 Mod 文件目录及 3DMigoto 配置脚本，不修改任何游戏客户端原始文件。</li>
             <li>请遵守游戏社区规范，切勿在官方平台传播第三方外观替换截图。</li>
-            <li>首次配置路径或迁移旧版 QAQManager v4 数据，建议点击下方「进入 4 步初始化向导」。</li>
+            <li>首次配置路径时，可使用下方的「进入 4 步初始化向导」。</li>
           </ul>
         </div>
       </Modal>

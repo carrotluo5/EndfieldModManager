@@ -151,7 +151,7 @@ export function Sidebar() {
                 <motion.span
                   layoutId="sidebar-active-pill"
                   transition={{ type: "spring", stiffness: 520, damping: 38 }}
-                  className="absolute inset-0 rounded-xl bg-[var(--accent)] shadow-sm"
+                  className="absolute inset-0 rounded-xl bg-[var(--accent-fill)] shadow-sm"
                 />
               )}
               <span className="relative z-10 flex items-center gap-2.5 whitespace-nowrap">
@@ -225,7 +225,7 @@ export function Sidebar() {
                   onClick={() => handleSelectMode(m.value)}
                   className={`rounded-lg py-1 text-[11px] font-semibold whitespace-nowrap transition-colors ${
                     selected
-                      ? "bg-[var(--accent)] text-[var(--accent-contrast)] shadow-xs"
+                      ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)] shadow-xs"
                       : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
                   }`}
                 >
@@ -241,7 +241,7 @@ export function Sidebar() {
           onClick={handleLaunchGame}
           disabled={launching}
           title={collapsed ? `启动游戏 (${launchMode})` : undefined}
-          className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent)] px-3 py-2.5 text-sm font-semibold whitespace-nowrap text-[var(--accent-contrast)] shadow-sm transition-all hover:bg-[var(--accent-hover)] active:scale-[0.99] disabled:opacity-60"
+          className="flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--accent-fill)] px-3 py-2.5 text-sm font-semibold whitespace-nowrap text-[var(--accent-contrast)] shadow-sm transition-all hover:bg-[var(--accent-fill-hover)] active:scale-[0.99] disabled:opacity-60"
         >
           {launching ? (
             <Loader2 className="h-4 w-4 shrink-0 animate-spin" />

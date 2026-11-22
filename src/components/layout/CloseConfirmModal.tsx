@@ -68,7 +68,7 @@ export function CloseConfirmModal() {
             type="button"
             onClick={handleMinimize}
             disabled={busy}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-4 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-4 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent-fill)] hover:text-[var(--accent-contrast)]"
           >
             <Minimize2 className="h-3.5 w-3.5" />
             <span>最小化到托盘</span>

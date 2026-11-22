@@ -1,0 +1,58 @@
+name: Release Windows Packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck and build frontend
+        run: npm run build:frontend
+
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+
+      - name: Build NSIS installer, Portable ZIP, Update ZIP and latest.json
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -eq "main" -and "${{ inputs.tag }}") { $tag = "${{ inputs.tag }}" }
+          New-Item -ItemType Directory -Force -Path release-artifacts | Out-Null
+          node scripts/build-release.mjs --output-directory release-artifacts --repo "${{ github.repository }}" --notes "Endfield Mod Manager $tag"
+
+      - name: Upload GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/EndfieldModManager-v*-windows-x64-portable.zip
+            release-artifacts/EndfieldModManager-v*-windows-x64-update.zip
+            release-artifacts/EndfieldModManager_*_x64-setup.exe
+            release-artifacts/latest.json
+          generate_release_notes: true

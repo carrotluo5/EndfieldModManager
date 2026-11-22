@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -12,6 +12,7 @@ import {
   arrayMove,
   rectSortingStrategy,
   useSortable,
+  verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -32,7 +33,11 @@ import {
   Keyboard,
   Layers,
   LayoutGrid,
-  PanelRight,
+  List,
+  LocateFixed,
+  Ellipsis,
+  PanelRightClose,
+  PanelRightOpen,
   Pencil,
   Pin,
   Plus,
@@ -66,11 +71,12 @@ import type {
   TagPoolItem,
 } from "../../types/mod";
 import { BackupRollbackModal } from "../modals/FixerModal";
-import { ContextMenu, type ContextMenuState } from "../ui/ContextMenu";
+import { ContextMenu, type ContextMenuItem, type ContextMenuState } from "../ui/ContextMenu";
 import { HotkeyRecorderModal } from "../ui/HotkeyRecorderModal";
 import { ImageCropModal } from "../ui/ImageCropModal";
 import { LightboxModal } from "../ui/LightboxModal";
 import { Modal } from "../ui/Modal";
+import { SelectMenu } from "../ui/SelectMenu";
 import { TagPoolModal } from "../ui/TagPoolModal";
 import { AppearanceSectionBar } from "./AppearanceSectionBar";
 
@@ -84,13 +90,61 @@ function getTagBadgeStyle(tagColor?: string): React.CSSProperties | undefined {
 }
 
 type SortMode = "custom" | "enabled" | "name" | "recent";
-type ViewLayout = "detail" | "grid";
+const SORT_OPTIONS = [
+  { value: "name", label: "名称" },
+  { value: "enabled", label: "状态" },
+  { value: "recent", label: "时间" },
+  { value: "custom", label: "自定义" },
+] as const;
+type ViewLayout = "list" | "gallery";
+const DEFAULT_DETAIL_SHARE = 0.4;
+
+const MIN_DETAIL_WIDTH = 280;
+const MAX_DETAIL_WIDTH = 850;
+// Keep a usable left pane and room for its separator at the smallest window size.
+const LEFT_PANE_SPACE = 340;
+
+function clampDetailWidth(width: number, availableWidth: number): number {
+  const maxWidth = Math.max(MIN_DETAIL_WIDTH, Math.min(MAX_DETAIL_WIDTH, availableWidth - LEFT_PANE_SPACE));
+  return Math.min(maxWidth, Math.max(MIN_DETAIL_WIDTH, width));
+}
+
+function readPreference(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writePreference(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // The view still works if local storage is unavailable.
+  }
+}
+
+function initialSortMode(): SortMode {
+  const stored = readPreference("efmm.modSort");
+  return stored === "custom" || stored === "enabled" || stored === "recent" ? stored : "name";
+}
+
+function initialDetailShare(): number {
+  const saved = Number(readPreference("efmm.modDetailShare"));
+  return saved > 0 && saved < 1 ? saved : DEFAULT_DETAIL_SHARE;
+}
+
+function isEditingText(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement &&
+    (target.isContentEditable || Boolean(target.closest('input, textarea, select, [role="combobox"]')));
+}
 
 interface SortableModCardProps {
   item: DisplayModItem;
   selected: boolean;
   dndEnabled: boolean;
-  compactLayout: boolean;
+  listLayout: boolean;
   tagColorMap: Record<string, string>;
   onSelect: () => void;
   onToggleEnable: () => void;
@@ -102,7 +156,7 @@ function SortableModCard({
   item,
   selected,
   dndEnabled,
-  compactLayout,
+  listLayout,
   tagColorMap,
   onSelect,
   onToggleEnable,
@@ -111,7 +165,7 @@ function SortableModCard({
 }: SortableModCardProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: item.name,
-    disabled: !dndEnabled,
+    disabled: { draggable: !dndEnabled, droppable: !dndEnabled },
   });
 
   const style: React.CSSProperties = {
@@ -122,25 +176,50 @@ function SortableModCard({
   };
 
   const previewUrl = buildMediaUrl(item.previewPath, item.previewMtime);
+  const toggle = (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={item.enabled}
+      aria-label={item.name + " 启用状态"}
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggleEnable();
+      }}
+      title={item.enabled ? "点击禁用此 Mod" : "点击启用此 Mod"}
+      className={"flex min-h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 text-xs font-semibold transition-colors " +
+        (listLayout ? "mr-2 " : "") +
+        (item.enabled
+          ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
+          : "bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]")}
+    >
+      <Power className="h-3.5 w-3.5" />
+      <span>{item.enabled ? "已启用" : "未启用"}</span>
+    </button>
+  );
 
   return (
     <div
       ref={setNodeRef}
       style={style}
-      {...(dndEnabled ? attributes : {})}
+      data-mod-name={item.name}
+      {...(dndEnabled ? attributes : { role: "button", tabIndex: 0 })}
       {...(dndEnabled ? listeners : {})}
+      onKeyDown={(e) => {
+        if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
       onClick={onSelect}
       onContextMenu={onContextMenu}
-      className={`glass-card group flex cursor-pointer flex-col overflow-hidden rounded-2xl transition-all hover:-translate-y-0.5 ${
-        selected
-          ? "border-[var(--accent)] ring-2 ring-[var(--accent-soft)]"
-          : item.enabled
-            ? "border-[var(--accent)]/45"
-            : "hover:border-[var(--border-strong)]"
-      }`}
+      className={"glass-card group flex min-w-0 cursor-pointer overflow-hidden rounded-2xl bg-[var(--bg-surface-strong)] transition-colors " +
+        (listLayout ? "min-h-20 items-center px-2.5 py-2 " : "flex-col ") +
+        (selected ? "border-[var(--accent)] ring-2 ring-[var(--accent-soft)]" :
+          item.enabled ? "border-[var(--accent)]/45" : "hover:border-[var(--border-strong)]")}
     >
-      {/* 16:10 Preview */}
-      <div className="relative aspect-[16/10] w-full overflow-hidden bg-[var(--bg-elevated)]">
+      <div className={"relative overflow-hidden bg-[var(--bg-elevated)] " +
+        (listLayout ? "aspect-[4/3] w-22 shrink-0 rounded-xl" : "aspect-[4/3] w-full")}>
         {previewUrl ? (
           <img
             src={previewUrl}
@@ -151,14 +230,14 @@ function SortableModCard({
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center gap-1 text-[var(--text-muted)]">
             <ImageIcon className="h-6 w-6 opacity-50" />
-            <span className="text-[11px]">无预览图</span>
+            {!listLayout && <span className="text-[11px]">无预览图</span>}
           </div>
         )}
 
         {/* Top badges */}
-        <div className="pointer-events-none absolute inset-x-2 top-2 flex flex-wrap items-center gap-1">
+        {!listLayout && <div className="pointer-events-none absolute inset-x-2 top-2 flex flex-wrap items-center gap-1">
           {item.pinned && (
-            <span className="inline-flex items-center gap-0.5 rounded-full bg-[var(--accent)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-contrast)]">
+            <span className="inline-flex items-center gap-0.5 rounded-full bg-[var(--accent-fill)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-contrast)]">
               <Pin className="h-2.5 w-2.5" />
               <span>置顶</span>
             </span>
@@ -184,50 +263,39 @@ function SortableModCard({
               <span>冲突</span>
             </span>
           )}
-        </div>
-
-        {/* Enable switch bottom-right */}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleEnable();
-          }}
-          title={item.enabled ? "点击禁用此 Mod" : "点击启用此 Mod"}
-          className={`absolute right-2 bottom-2 flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-semibold shadow-sm backdrop-blur-xs transition-all ${
-            item.enabled
-              ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
-              : "bg-black/62 text-white/90 hover:bg-black/80"
-          }`}
-        >
-          <Power className="h-3 w-3" />
-          <span>{item.enabled ? "已启用" : "未启用"}</span>
-        </button>
+        </div>}
       </div>
 
-      {/* Body */}
-      <div className={`flex flex-1 flex-col justify-between gap-2 ${compactLayout ? "p-2.5" : "p-3"}`}>
-        <div>
-          <div className="line-clamp-2 text-xs font-semibold leading-snug text-[var(--text-primary)]">
-            {item.collection ? item.collection.name : item.name}
+      <div className="flex min-w-0 flex-1 flex-col justify-between gap-2 px-3.5 py-2.5">
+        <div className="flex min-w-0 items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div title={item.collection?.name ?? item.name} className="line-clamp-2 text-sm font-semibold leading-snug text-[var(--text-primary)]">
+              {item.collection?.name ?? item.name}
+            </div>
+            {listLayout && !item.collection && (
+              <div title={item.dirName} className="mt-0.5 truncate text-xs text-[var(--text-secondary)]">
+                {item.dirName}
+              </div>
+            )}
           </div>
-
-          {item.collection && (
-            <select
-              value={item.name}
-              onClick={(e) => e.stopPropagation()}
-              onChange={(e) => onSelectCollectionVariant(item.collection!.identity, e.target.value)}
-              className="mt-1.5 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text-primary)]"
-            >
-              {item.collection.variants.map((v) => (
-                <option key={v.name} value={v.name}>
-                  {getCollectionVariantLabel(v)}
-                  {v.enabled ? "（已启用）" : ""}
-                </option>
-              ))}
-            </select>
-          )}
+          {!listLayout && toggle}
         </div>
+
+        {item.collection && (
+          <div onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+            <SelectMenu
+              aria-label="合集变体"
+              value={item.name}
+              onChange={(name) => onSelectCollectionVariant(item.collection!.identity, name)}
+              options={item.collection.variants.map((variant) => ({
+                value: variant.name,
+                label: getCollectionVariantLabel(variant) + (variant.enabled ? "（已启用）" : ""),
+              }))}
+              className="w-full"
+              size="compact"
+            />
+          </div>
+        )}
 
         {item.tags.length > 0 && (
           <div className="flex flex-wrap gap-1">
@@ -249,15 +317,17 @@ function SortableModCard({
           </div>
         )}
       </div>
+      {listLayout && toggle}
     </div>
   );
 }
 
 interface ModViewProps {
   characterName: string;
+  previewDropTarget: string | null;
 }
 
-export function ModView({ characterName }: ModViewProps) {
+export function ModView({ characterName, previewDropTarget }: ModViewProps) {
   const config = useAppStore((s) => s.config);
   const modsTick = useAppStore((s) => s.modsTick);
   const undoStack = useAppStore((s) => s.undoStack);
@@ -283,13 +353,41 @@ export function ModView({ characterName }: ModViewProps) {
   const [tagPool, setTagPool] = useState<TagPoolItem[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const [selectedSectionId, setSelectedSectionId] = useState("all");
+  const [selectedSectionId, setSelectedSectionId] = useState(
+    () => readPreference("efmm.modSection." + characterName) || "base"
+  );
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilterTags, setSelectedFilterTags] = useState<string[]>([]);
-  const [sortMode, setSortMode] = useState<SortMode>("custom");
-  const [collapseCollections, setCollapseCollections] = useState(true);
+  const [sortMode, setSortMode] = useState(initialSortMode);
+  const [collapseCollections, setCollapseCollections] = useState(
+    () => readPreference("efmm.modCollections." + characterName) === "true"
+  );
   const [selectedVariants, setSelectedVariants] = useState<Record<string, string>>({});
-  const [viewLayout, setViewLayout] = useState<ViewLayout>("detail");
+  const [viewLayout, setViewLayout] = useState<ViewLayout>(
+    () => readPreference("efmm.modLayout") === "gallery" ? "gallery" : "list"
+  );
+  const [detailOpen, setDetailOpen] = useState(true);
+  const [detailShare, setDetailShare] = useState(initialDetailShare);
+  const [resizing, setResizing] = useState(false);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const expandDetailRef = useRef<HTMLButtonElement>(null);
+  const collapseDetailRef = useRef<HTMLButtonElement>(null);
+  const moveDetailFocus = useRef(false);
+  const changeDetailVisibility = (open: boolean) => {
+    moveDetailFocus.current = true;
+    setDetailOpen(open);
+  };
+  const resizeWidth = (width: number) => {
+    const availableWidth = workspaceRef.current?.clientWidth;
+    if (!availableWidth) return;
+    const next = clampDetailWidth(width, availableWidth);
+    setDetailShare(next / availableWidth);
+  };
+  const resizeStart = useRef<{ x: number; width: number } | null>(null);
+  const detailPanel = useRef<HTMLElement>(null);
+  const modList = useRef<HTMLDivElement>(null);
+  const locateIndex = useRef(0);
+  const [scrollTarget, setScrollTarget] = useState<string | null>(null);
 
   const [selectedModName, setSelectedModName] = useState<string | null>(null);
   const [details, setDetails] = useState<ModDetails | null>(null);
@@ -334,33 +432,59 @@ export function ModView({ characterName }: ModViewProps) {
     })
   );
 
-  // Reset filters when switching character
+  const loadRequest = useRef(0);
+  useEffect(() => () => { loadRequest.current += 1; }, []);
+  useEffect(() => writePreference("efmm.modSort", sortMode), [sortMode]);
+  useEffect(() => writePreference("efmm.modLayout", viewLayout), [viewLayout]);
+  useLayoutEffect(() => {
+    if (readPreference("efmm.modDetailShare")) return;
+    const availableWidth = workspaceRef.current?.clientWidth;
+    if (!availableWidth) return;
+    try {
+      const widths = JSON.parse(readPreference("efmm.modDetailWidths") ?? "null") as Partial<Record<ViewLayout, number>> | null;
+      const oldLayout = readPreference("efmm.modLayout") === "gallery" ? "gallery" : "list";
+      const width = widths?.[oldLayout] ?? widths?.[oldLayout === "list" ? "gallery" : "list"];
+      if (typeof width === "number" && width >= MIN_DETAIL_WIDTH && width <= MAX_DETAIL_WIDTH) {
+        setDetailShare(clampDetailWidth(width, availableWidth) / availableWidth);
+      }
+    } catch {
+      // Use the shared default if the previous preference cannot be read.
+    }
+  }, []);
   useEffect(() => {
-    setSelectedSectionId("all");
-    setSearchQuery("");
-    setSelectedFilterTags([]);
-    setSelectedModName(null);
-    setDetails(null);
-  }, [characterName]);
+    if (!resizing) writePreference("efmm.modDetailShare", String(detailShare));
+  }, [detailShare, resizing]);
+
+  useEffect(() => {
+    writePreference("efmm.modSection." + characterName, selectedSectionId);
+  }, [characterName, selectedSectionId]);
 
   const loadData = useCallback(async () => {
+    const request = ++loadRequest.current;
     setLoading(true);
     try {
       const [modsRes, secList, pool] = await Promise.all([
         api.listMods(characterName),
         api.listAppearanceSections(characterName),
-        api.getTagsPool(),
+        api.getTagsPool().catch(() => ({ tags: [] })),
       ]);
+      if (request !== loadRequest.current) return;
       setMods(modsRes.mods);
       setAliases(modsRes.characterAliases);
       setConflicts(modsRes.conflicts);
       setIsNonCharCategory(modsRes.isNonCharacterCategory);
       setSections(secList);
       setTagPool(pool.tags);
+      setSelectedSectionId((id) => {
+        if (id === "all" || secList.some((section) => section.id === id)) return id;
+        return secList.some((section) => section.id === "base") ? "base" : "all";
+      });
     } catch (err) {
-      addToast("error", `加载 Mod 列表失败：${String(err)}`);
+      if (request === loadRequest.current) {
+        addToast("error", `加载 Mod 列表失败：${String(err)}`);
+      }
     } finally {
-      setLoading(false);
+      if (request === loadRequest.current) setLoading(false);
     }
   }, [characterName, addToast]);
 
@@ -402,14 +526,17 @@ export function ModView({ characterName }: ModViewProps) {
     if (sortMode === "enabled") {
       list.sort(
         (a, b) =>
-          Number(b.enabled) - Number(a.enabled) ||
           Number(b.pinned) - Number(a.pinned) ||
+          Number(b.enabled) - Number(a.enabled) ||
           a.name.localeCompare(b.name, "zh-CN")
       );
     } else if (sortMode === "name") {
-      list.sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+      list.sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name, "zh-CN"));
     } else if (sortMode === "recent") {
-      list.sort((a, b) => b.addedAtMs - a.addedAtMs || a.name.localeCompare(b.name, "zh-CN"));
+      list.sort((a, b) =>
+        Number(b.pinned) - Number(a.pinned) || b.addedAtMs - a.addedAtMs ||
+        a.name.localeCompare(b.name, "zh-CN")
+      );
     }
     return list;
   }, [mods, sortMode]);
@@ -437,32 +564,75 @@ export function ModView({ characterName }: ModViewProps) {
     return buildModCollectionView(filteredMods, characterName, aliases, selectedVariants);
   }, [collapseCollections, filteredMods, characterName, aliases, selectedVariants]);
 
-  // Keep selectedModName valid and consume pendingFocusMod
+  const selectMod = (name: string, scroll = false) => {
+    setSelectedModName(name);
+    setDetailOpen(true);
+    if (scroll) setScrollTarget(name);
+  };
+
   useEffect(() => {
-    if (pendingFocusMod && pendingFocusMod.characterName === characterName) {
-      const hit = mods.find((m) => m.name === pendingFocusMod.modName);
-      if (hit) {
-        setSelectedModName(hit.name);
-        setSelectedSectionId("all");
-        setPendingFocusMod(null);
+    locateIndex.current = 0;
+  }, [characterName, selectedSectionId, searchQuery, selectedFilterTags, sortMode]);
+
+  useEffect(() => {
+    if (!pendingFocusMod || pendingFocusMod.characterName !== characterName) return;
+    const hit = mods.find((m) => m.name === pendingFocusMod.modName);
+    if (hit) {
+      setSelectedSectionId(hit.sectionId);
+      setSearchQuery("");
+      setSelectedFilterTags([]);
+      setSelectedModName(hit.name);
+      setDetailOpen(true);
+      setScrollTarget(hit.name);
+      setPendingFocusMod(null);
+    }
+  }, [mods, pendingFocusMod, characterName, setPendingFocusMod]);
+
+  useEffect(() => {
+    if (pendingFocusMod?.characterName === characterName &&
+        mods.some((m) => m.name === pendingFocusMod.modName)) return;
+    if (selectedModName) {
+      const group = displayMods.find((m) => m.collection?.variants.some((v) => v.name === selectedModName));
+      const collection = group?.collection;
+      if (collection && group.name !== selectedModName) {
+        setSelectedVariants((prev) => ({ ...prev, [collection.identity]: selectedModName }));
         return;
       }
     }
-    if (displayMods.length === 0) {
-      setSelectedModName(null);
-      setDetails(null);
-      return;
+    if (!displayMods.some((m) => m.name === selectedModName)) {
+      setSelectedModName(displayMods[0]?.name ?? null);
     }
-    const stillExists = selectedModName && mods.some((m) => m.name === selectedModName);
-    if (!stillExists) {
-      setSelectedModName(displayMods[0].name);
+  }, [displayMods, mods, selectedModName, pendingFocusMod, characterName]);
+
+  useEffect(() => {
+    if (!scrollTarget) return;
+    const card = Array.from(modList.current?.querySelectorAll<HTMLElement>("[data-mod-name]") ?? [])
+      .find((element) => element.dataset.modName === scrollTarget);
+    if (card) {
+      card.scrollIntoView({
+        block: "nearest",
+        behavior: (config?.compatLevel ?? 0) >= 2 || window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "auto" : "smooth",
+      });
+      setScrollTarget(null);
+    } else if (!filteredMods.some((m) => m.name === scrollTarget)) {
+      setScrollTarget(null);
     }
-  }, [displayMods, mods, selectedModName, pendingFocusMod, characterName, setPendingFocusMod]);
+  }, [displayMods, filteredMods, scrollTarget, config?.compatLevel]);
+
+  const visibleEnabledMods = filteredMods.filter((m) => m.enabled);
+  const handleLocateEnabled = () => {
+    const next = visibleEnabledMods[locateIndex.current % visibleEnabledMods.length];
+    if (!next) return;
+    locateIndex.current += 1;
+    selectMod(next.name, true);
+  };
 
   // Load ModDetails when selectedModName changes
   useEffect(() => {
     if (!selectedModName) {
       setDetails(null);
+      setDetailsLoading(false);
       return;
     }
     let cancelled = false;
@@ -491,26 +661,32 @@ export function ModView({ characterName }: ModViewProps) {
   const dndEnabled =
     sortMode === "custom" &&
     !searchQuery.trim() &&
-    selectedSectionId === "all" &&
     selectedFilterTags.length === 0;
+  const reorderableMods = displayMods.filter((item) =>
+    !item.pinned && !item.collection?.variants.some((variant) => variant.pinned)
+  );
+  const reorderableNames = new Set(reorderableMods.map((item) => item.name));
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
-    if (!over || active.id === over.id) return;
+    if (!dndEnabled || !over || active.id === over.id) return;
 
-    const oldIndex = displayMods.findIndex((m) => m.name === active.id);
-    const newIndex = displayMods.findIndex((m) => m.name === over.id);
+    const oldIndex = reorderableMods.findIndex((m) => m.name === active.id);
+    const newIndex = reorderableMods.findIndex((m) => m.name === over.id);
     if (oldIndex === -1 || newIndex === -1) return;
 
-    const reorderedDisplay = arrayMove(displayMods, oldIndex, newIndex);
-    const expandedOrder: string[] = [];
-    for (const d of reorderedDisplay) {
-      if (d.collection && d.collection.variants.length > 0) {
-        for (const v of d.collection.variants) expandedOrder.push(v.name);
-      } else {
-        expandedOrder.push(d.name);
-      }
-    }
+    const diskOrder = new Map(mods.map((mod, index) => [mod.name, index]));
+    const reorderedNames = arrayMove(reorderableMods, oldIndex, newIndex).flatMap((item) =>
+      item.collection
+        ? item.collection.variants.map((variant) => variant.name)
+          .sort((a, b) => (diskOrder.get(a) ?? 0) - (diskOrder.get(b) ?? 0))
+        : [item.name]
+    );
+    const reorderedSet = new Set(reorderedNames);
+    let nextIndex = 0;
+    const expandedOrder = mods.map(({ name }) =>
+      reorderedSet.has(name) ? reorderedNames[nextIndex++] : name
+    );
 
     try {
       await api.saveModOrder(characterName, expandedOrder);
@@ -584,8 +760,8 @@ export function ModView({ characterName }: ModViewProps) {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
-        const tag = (document.activeElement?.tagName ?? "").toUpperCase();
-        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        if (e.defaultPrevented || e.repeat || e.isComposing || isEditingText(e.target) ||
+            document.querySelector('[aria-modal="true"]')) return;
         if (undoStack.length === 0) return;
         e.preventDefault();
         void handleUndo();
@@ -599,8 +775,12 @@ export function ModView({ characterName }: ModViewProps) {
     if (!resetIniTarget) return;
     setResettingIni(true);
     try {
-      await api.resetModIni(characterName, resetIniTarget.name);
-      addToast("success", `已重置「${resetIniTarget.name}」的 INI 持久化状态`);
+      const count = await api.resetModIni(characterName, resetIniTarget.name);
+      if (count > 0) {
+        addToast("success", `已重置「${resetIniTarget.name}」的 EFMM 持久化状态`);
+      } else {
+        addToast("info", "此 Mod 暂无 EFMM 持久化状态");
+      }
       setResetIniTarget(null);
       bumpModsTick();
     } catch (err) {
@@ -638,6 +818,9 @@ export function ModView({ characterName }: ModViewProps) {
     try {
       await api.renameMod(characterName, renameTarget.name, trimmed);
       if (selectedModName === renameTarget.name) {
+        setMods((current) => current.map((item) => item.name === renameTarget.name
+          ? { ...item, name: trimmed, dirName: item.enabled ? trimmed : "DISABLED_" + trimmed }
+          : item));
         setSelectedModName(trimmed);
       }
       setRenameTarget(null);
@@ -840,365 +1023,495 @@ export function ModView({ characterName }: ModViewProps) {
 
   const totalEnabled = mods.filter((m) => m.enabled).length;
   const activeDisplayItem = displayMods.find((d) => d.name === selectedModName) ?? null;
-  const detailMod = details?.modItem ?? null;
+  const detailMod = details?.modItem.name === selectedModName ? details.modItem : null;
   const detailPreviewUrl = detailMod
     ? buildMediaUrl(detailMod.previewPath, detailMod.previewMtime)
     : null;
+  const showDetail = detailOpen && selectedModName !== null;
+  useEffect(() => {
+    if (!moveDetailFocus.current) return;
+    moveDetailFocus.current = false;
+    (showDetail ? collapseDetailRef : expandDetailRef).current?.focus({ preventScroll: true });
+  }, [showDetail]);
+  const layoutLabel = viewLayout === "gallery" ? "列表" : "画廊";
+  const LayoutIcon = viewLayout === "gallery" ? List : LayoutGrid;
+  const openMoreActions = (button: HTMLButtonElement) => {
+    const rect = button.getBoundingClientRect();
+    const items: ContextMenuItem[] = [
+      {
+        key: "import", label: "导入到此角色", icon: <Archive size={15} />,
+        onClick: () => openImportWizard([], characterName),
+      },
+      {
+        key: "fix", label: "修复本角色", icon: <Wrench size={15} />,
+        onClick: () => openFixerModal({ scopeKind: "character", characterName }),
+      },
+      {
+        key: "folder", label: "打开角色目录", icon: <FolderOpen size={15} />,
+        disabled: !config?.modsPath,
+        onClick: () => {
+          if (!config?.modsPath) return;
+          void api.openPathInExplorer(`${config.modsPath}\${characterName}`).catch((err) => addToast("error", String(err)));
+        },
+      },
+      {
+        key: "refresh", label: "刷新列表", icon: <RefreshCw size={15} />,
+        disabled: loading,
+        onClick: () => void loadData(),
+      },
+      {
+        key: "undo", label: "撤销上一步", icon: <Undo2 size={15} />,
+        shortcut: "Ctrl+Z", disabled: undoing || undoStack.length === 0,
+        onClick: () => void handleUndo(),
+      },
+      {
+        key: "tags", label: "管理标签池", icon: <Tag size={15} />,
+        onClick: () => setTagPoolOpen(true),
+      },
+    ];
+    setCtxMenu({ x: rect.right - 216, y: rect.bottom + 6, anchor: button, items });
+  };
+
+  useEffect(() => {
+    if (!detailOpen || !detailMod) return;
+    const modName = detailMod.name;
+    const handlePaste = (event: ClipboardEvent) => {
+      if (event.defaultPrevented ||
+          isEditingText(event.target) ||
+          document.querySelector('[aria-modal="true"]')) return;
+      const file = Array.from(event.clipboardData?.files ?? [])
+        .find((image) => /^image\/(png|jpeg|webp)$/.test(image.type));
+      if (!file) return;
+      event.preventDefault();
+      const reader = new FileReader();
+      reader.onload = async () => {
+        if (typeof reader.result !== "string") return;
+        try {
+          await api.setModPreviewData(characterName, modName, reader.result);
+          bumpModsTick();
+          addToast("success", "已将剪贴板图片设为 Mod 预览图");
+        } catch (err) {
+          addToast("error", String(err));
+        }
+      };
+      reader.onerror = () => addToast("error", "无法读取剪贴板图片");
+      reader.readAsDataURL(file);
+    };
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
+  }, [detailOpen, detailMod, characterName, bumpModsTick, addToast]);
+
+  const assignSection = async (mod: ModItem, sectionId: string) => {
+    if (sectionId === mod.sectionId) return true;
+    try {
+      await api.assignModSection(characterName, mod.name, sectionId);
+      setMods((current) => current.map((item) =>
+        item.name === mod.name ? { ...item, sectionId } : item
+      ));
+      setSelectedSectionId(sectionId);
+      setSearchQuery("");
+      setSelectedFilterTags([]);
+      selectMod(mod.name, true);
+      bumpModsTick();
+      const sectionName = sections.find((section) => section.id === sectionId)?.name;
+      addToast("success", sectionName ? `已分配到「${sectionName}」` : "已更新外观分区");
+      return true;
+    } catch (err) {
+      addToast("error", String(err));
+      return false;
+    }
+  };
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* Header & controls */}
-      <div className="space-y-2.5 px-5 pt-3.5 pb-2.5">
-        <div className="flex flex-wrap items-center justify-between gap-2.5">
-          <div className="flex items-center gap-2.5">
-            <button
-              type="button"
-              onClick={() => setSelectedCharacter(null)}
-              className="glass-surface inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium text-[var(--text-primary)] hover:border-[var(--border-strong)]"
-            >
-              <ArrowLeft className="h-3.5 w-3.5" />
-              <span>返回角色</span>
-            </button>
-            <h1 className="text-lg font-bold text-[var(--text-primary)]">{characterName}</h1>
-            <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-0.5 text-xs font-semibold text-[var(--accent)] tabular-nums">
-              {totalEnabled} / {mods.length} 已启用
-            </span>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Search */}
-            <div className="relative w-56">
-              <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-muted)]" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="筛选 Mod / 标签 / 拼音..."
-                className="glass-surface w-full rounded-xl py-1.5 pr-7 pl-8 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)]"
-              />
-              {searchQuery && (
+    <div className="h-full overflow-hidden p-3 md:p-4 xl:p-5">
+      <div
+        ref={workspaceRef}
+        style={{ "--mod-detail-share": `${detailShare * 100}cqw` } as React.CSSProperties}
+        className="mod-workspace flex h-full min-h-0"
+      >
+        <section aria-label="角色 Mod" className="glass-surface flex min-w-0 flex-1 flex-col overflow-hidden rounded-3xl bg-[var(--bg-surface-strong)]">
+          <header className="max-h-[48%] shrink-0 space-y-3 overflow-y-auto border-b border-[var(--border-subtle)] px-3 pt-3 pb-2.5 xl:px-5 xl:pt-4">
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex min-w-0 flex-wrap items-center gap-2.5">
                 <button
                   type="button"
-                  onClick={() => setSearchQuery("")}
-                  className="absolute top-1/2 right-2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                  onClick={() => setSelectedCharacter(null)}
+                  title="返回角色一览"
+                  aria-label="返回角色一览"
+                  className="glass-surface grid h-9 w-9 place-items-center rounded-xl text-[var(--text-primary)] hover:border-[var(--border-strong)]"
                 >
-                  <X className="h-3 w-3" />
+                  <ArrowLeft className="h-3.5 w-3.5" />
                 </button>
-              )}
-            </div>
+                <h1 className="min-w-0 text-2xl leading-tight font-bold [overflow-wrap:anywhere] text-[var(--text-primary)]">{characterName}</h1>
+                <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-1 text-xs font-semibold whitespace-nowrap text-[var(--accent)] tabular-nums">
+                  {totalEnabled} / {mods.length} 已启用
+                </span>
+              </div>
 
-            {/* Sort */}
-            <select
-              value={sortMode}
-              onChange={(e) => setSortMode(e.target.value as SortMode)}
-              className="glass-surface rounded-xl px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)]"
-            >
-              <option value="custom">自定义排序</option>
-              <option value="enabled">启用优先</option>
-              <option value="name">名称排序</option>
-              <option value="recent">最近添加</option>
-            </select>
-
-            {/* Exclusive mode */}
-            <button
-              type="button"
-              onClick={handleToggleExclusive}
-              title={
-                exclusive
-                  ? "排他模式开启：同一分类一次仅允许启用 1 个 Mod"
-                  : "排他模式关闭：允许同分类同时启用多个 Mod"
-              }
-              className={`rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
-                exclusive
-                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : "glass-surface text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-              }`}
-            >
-              {exclusive ? "排他模式：开" : "排他模式：关"}
-            </button>
-
-            {/* Collection collapse */}
-            <button
-              type="button"
-              onClick={() => setCollapseCollections((v) => !v)}
-              className={`inline-flex items-center gap-1 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
-                collapseCollections
-                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : "glass-surface text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-              }`}
-            >
-              <Sparkles className="h-3.5 w-3.5" />
-              <span>合集折叠</span>
-            </button>
-
-            {/* Layout switch */}
-            <div className="glass-surface flex items-center rounded-xl p-0.5">
-              <button
-                type="button"
-                onClick={() => setViewLayout("detail")}
-                title="双栏详情画廊"
-                className={`rounded-lg p-1.5 ${
-                  viewLayout === "detail"
-                    ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
-                    : "text-[var(--text-secondary)]"
-                }`}
-              >
-                <PanelRight className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setViewLayout("grid")}
-                title="宽屏网格"
-                className={`rounded-lg p-1.5 ${
-                  viewLayout === "grid"
-                    ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
-                    : "text-[var(--text-secondary)]"
-                }`}
-              >
-                <LayoutGrid className="h-3.5 w-3.5" />
-              </button>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => openImportWizard([], characterName)}
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
-            >
-              <Archive className="h-3.5 w-3.5" />
-              <span>导入到此角色</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() =>
-                openFixerModal({
-                  scopeKind: "character",
-                  characterName,
-                })
-              }
-              className="glass-surface inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)] hover:border-[var(--border-strong)]"
-            >
-              <Wrench className="h-3.5 w-3.5" />
-              <span>修复本角色</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                if (config?.modsPath) {
-                  void api.openPathInExplorer(`${config.modsPath}\\${characterName}`);
-                }
-              }}
-              title="打开角色目录"
-              className="glass-surface rounded-xl p-2 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-            >
-              <FolderOpen className="h-3.5 w-3.5" />
-            </button>
-
-            <button
-              type="button"
-              onClick={() => void loadData()}
-              disabled={loading}
-              title="刷新列表"
-              className="glass-surface rounded-xl p-2 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-            </button>
-
-            {undoStack.length > 0 && (
-              <button
-                type="button"
-                onClick={() => void handleUndo()}
-                disabled={undoing}
-                title={`撤销上一步：${undoStack[0].label} (Ctrl+Z)`}
-                className="glass-surface inline-flex items-center gap-1 rounded-xl border border-[var(--border-strong)] px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:opacity-50"
-              >
-                <Undo2 className="h-3.5 w-3.5" />
-                <span>撤销</span>
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Appearance Section bar */}
-        <AppearanceSectionBar
-          characterName={characterName}
-          sections={sections}
-          selectedSectionId={selectedSectionId}
-          onSelectSection={setSelectedSectionId}
-          totalModCount={mods.length}
-          totalEnabledCount={totalEnabled}
-          onSectionsChanged={bumpModsTick}
-        />
-
-        {/* Multi-select AND Tag Filter */}
-        <div className="flex flex-wrap items-center gap-1.5">
-          {availableFilterTags.length > 0 && (
-            <>
-              <span className="inline-flex items-center gap-1 text-[11px] text-[var(--text-muted)]">
-                <Tag className="h-3 w-3" />
-                <span>标签筛选：</span>
-              </span>
-              {availableFilterTags.map((tagName) => {
-                const active = selectedFilterTags.includes(tagName);
-                const poolColor = tagPool.find((t) => t.name === tagName)?.color;
-                const inactiveStyle = !active ? getTagBadgeStyle(poolColor) : undefined;
-                return (
-                  <button
-                    key={tagName}
-                    type="button"
-                    style={
-                      active && poolColor
-                        ? { backgroundColor: poolColor, borderColor: poolColor, color: "#ffffff" }
-                        : inactiveStyle
-                    }
-                    onClick={() =>
-                      setSelectedFilterTags((prev) =>
-                        prev.includes(tagName)
-                          ? prev.filter((x) => x !== tagName)
-                          : [...prev, tagName]
-                      )
-                    }
-                    className={`rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors ${
-                      active
-                        ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
-                        : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]"
-                    }`}
-                  >
-                    {tagName}
-                  </button>
-                );
-              })}
-              {selectedFilterTags.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Exclusive mode */}
                 <button
                   type="button"
-                  onClick={() => setSelectedFilterTags([])}
-                  className="text-[11px] text-[var(--accent)] hover:underline"
-                >
-                  清除标签
-                </button>
-              )}
-            </>
-          )}
-          <button
-            type="button"
-            onClick={() => setTagPoolOpen(true)}
-            className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border-strong)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-          >
-            <Plus className="h-3 w-3" />
-            <span>管理标签池</span>
-          </button>
-        </div>
-
-        {/* Hash Conflict Banner */}
-        {conflicts.length > 0 && (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--danger)]/40 bg-[var(--danger-soft)] px-3.5 py-2 text-xs text-[var(--danger)]">
-            <div className="flex items-center gap-2 font-medium">
-              <AlertTriangle className="h-4 w-4 shrink-0" />
-              <span>
-                检测到 {conflicts.length} 组已启用 Mod 存在相同资源 Hash 冲突：
-                {conflicts
-                  .slice(0, 2)
-                  .map((g) => `${g.mods.join(" / ")}`)
-                  .join("；")}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                const firstConflictMod = conflicts[0]?.mods[0];
-                if (firstConflictMod) setSelectedModName(firstConflictMod);
-              }}
-              className="rounded-lg bg-[var(--danger)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90"
-            >
-              定位冲突 Mod
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Main Content Split */}
-      <div className="flex flex-1 gap-4 overflow-hidden px-5 pb-4">
-        {/* Left: Cards Grid */}
-        <div className="flex-1 overflow-y-auto pr-1">
-          {displayMods.length === 0 ? (
-            <div className="glass-card mx-auto mt-10 max-w-md rounded-2xl p-6 text-center">
-              <p className="text-sm font-semibold text-[var(--text-primary)]">
-                暂无符合条件的 Mod
-              </p>
-              <p className="mt-1 text-xs text-[var(--text-secondary)]">
-                可尝试切换「全部外观」、清除搜索或标签筛选条件。
-              </p>
-            </div>
-          ) : (
-            <DndContext
-              sensors={sensors}
-              collisionDetection={closestCenter}
-              onDragEnd={handleDragEnd}
-            >
-              <SortableContext
-                items={displayMods.map((m) => m.name)}
-                strategy={rectSortingStrategy}
-              >
-                <div
-                  className={`grid gap-3.5 pb-4 ${
-                    viewLayout === "detail"
-                      ? "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
-                      : "grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6"
+                  onClick={handleToggleExclusive}
+                  aria-pressed={exclusive}
+                  title={
+                    exclusive
+                      ? "排他模式开启：同一分类一次仅允许启用 1 个 Mod"
+                      : "排他模式关闭：允许同分类同时启用多个 Mod"
+                  }
+                  className={`min-h-8 rounded-full border px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                    exclusive
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                      : "glass-surface text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
                   }`}
                 >
-                  {displayMods.map((item) => (
-                    <SortableModCard
-                      key={item.name}
-                      item={item}
-                      selected={selectedModName === item.name}
-                      dndEnabled={dndEnabled}
-                      compactLayout={viewLayout === "detail"}
-                      tagColorMap={Object.fromEntries(tagPool.map((t) => [t.name, t.color]))}
-                      onSelect={() => setSelectedModName(item.name)}
-                      onToggleEnable={() => void handleToggleMod(item.name, !item.enabled)}
-                      onSelectCollectionVariant={(identity, variantModName) => {
-                        setSelectedVariants((prev) => ({
-                          ...prev,
-                          [identity]: variantModName,
-                        }));
-                        setSelectedModName(variantModName);
-                      }}
-                      onContextMenu={(e) => handleModContextMenu(e, item)}
-                    />
-                  ))}
-                </div>
-              </SortableContext>
-            </DndContext>
-          )}
-        </div>
+                  单选
+                </button>
 
-        {/* Right: Sticky Details Sidebar */}
-        {viewLayout === "detail" && detailMod && (
-          <aside className="glass-card flex h-full w-[380px] shrink-0 flex-col overflow-hidden rounded-2xl xl:w-[420px]">
+                {/* Collection collapse */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    writePreference("efmm.modCollections." + characterName, String(!collapseCollections));
+                    setCollapseCollections(!collapseCollections);
+                  }}
+                  aria-pressed={collapseCollections}
+                  className={`inline-flex items-center gap-1 min-h-8 rounded-full border px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                    collapseCollections
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                      : "glass-surface text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                  }`}
+                >
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <span>合集</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setViewLayout(viewLayout === "gallery" ? "list" : "gallery")}
+                  aria-label={`切换到${layoutLabel}视图`}
+                  className="inline-flex min-h-8 items-center gap-1.5 whitespace-nowrap rounded-full bg-[var(--accent-fill)] px-3 text-xs font-semibold text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-fill-hover)]"
+                >
+                  <LayoutIcon className="h-4 w-4" />
+                  <span>进入{layoutLabel}</span>
+                </button>
+                {!showDetail && selectedModName && (
+                  <button
+                    type="button"
+                    ref={expandDetailRef}
+                    onClick={() => changeDetailVisibility(true)}
+                    aria-expanded={false}
+                    aria-controls="mod-detail-panel"
+                    aria-label="展开详情"
+                    title="展开详情"
+                    className="glass-surface grid h-8 w-8 place-items-center rounded-full text-[var(--text-secondary)] hover:text-[var(--accent)]"
+                  >
+                    <PanelRightOpen size={15} />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Appearance Section bar */}
+            <AppearanceSectionBar
+              characterName={characterName}
+              sections={sections}
+              selectedSectionId={selectedSectionId}
+              onSelectSection={setSelectedSectionId}
+              totalModCount={mods.length}
+              totalEnabledCount={totalEnabled}
+              onSectionsChanged={bumpModsTick}
+            />
+
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Search */}
+              <div className="relative min-w-38 flex-1">
+                <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-muted)]" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  aria-label="筛选 Mod"
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="筛选 Mod / 标签 / 拼音..."
+                  className="glass-surface min-h-9 w-full rounded-xl pr-8 pl-9 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)]"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery("")}
+                    aria-label="清除搜索"
+                    className="absolute top-1/2 right-2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                )}
+              </div>
+
+              {/* Sort */}
+              <SelectMenu
+                value={sortMode}
+                onChange={setSortMode}
+                options={SORT_OPTIONS}
+                aria-label="Mod 排序方式"
+                className="w-25"
+              />
+              <button
+                type="button"
+                disabled={visibleEnabledMods.length === 0}
+                onClick={handleLocateEnabled}
+                title="依次定位当前筛选结果中已启用的 Mod"
+                className="glass-surface inline-flex min-h-9 items-center gap-1.5 rounded-xl px-2.5 text-xs font-medium text-[var(--text-primary)] disabled:opacity-40"
+              >
+                <LocateFixed className="h-3.5 w-3.5" />
+                <span>定位</span>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  if (ctxMenu?.anchor === e.currentTarget) setCtxMenu(null);
+                  else openMoreActions(e.currentTarget);
+                }}
+                aria-label="更多操作"
+                aria-haspopup="menu"
+                aria-expanded={Boolean(ctxMenu?.anchor)}
+                title="更多操作"
+                className="glass-surface grid h-9 w-9 shrink-0 place-items-center rounded-xl text-[var(--text-secondary)] hover:text-[var(--accent)]"
+              >
+                <Ellipsis className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Multi-select AND Tag Filter */}
+            {availableFilterTags.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="inline-flex items-center gap-1 text-[11px] text-[var(--text-muted)]">
+                  <Tag className="h-3 w-3" />
+                  <span>标签筛选：</span>
+                </span>
+                {availableFilterTags.map((tagName) => {
+                  const active = selectedFilterTags.includes(tagName);
+                  const poolColor = tagPool.find((t) => t.name === tagName)?.color;
+                  const inactiveStyle = !active ? getTagBadgeStyle(poolColor) : undefined;
+                  return (
+                    <button
+                      key={tagName}
+                      type="button"
+                      style={
+                        active && poolColor
+                          ? { backgroundColor: poolColor, borderColor: poolColor, color: "#ffffff" }
+                          : inactiveStyle
+                      }
+                      onClick={() =>
+                        setSelectedFilterTags((prev) =>
+                          prev.includes(tagName)
+                            ? prev.filter((x) => x !== tagName)
+                            : [...prev, tagName]
+                        )
+                      }
+                      className={`rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                        active
+                          ? "border-[var(--accent)] bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
+                          : "border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]"
+                      }`}
+                    >
+                      {tagName}
+                    </button>
+                  );
+                })}
+                {selectedFilterTags.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedFilterTags([])}
+                    className="text-[11px] text-[var(--accent)] hover:underline"
+                  >
+                    清除标签
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Hash Conflict Banner */}
+            {conflicts.length > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--danger)]/40 bg-[var(--danger-soft)] px-3.5 py-2 text-xs text-[var(--danger)]">
+                <div className="flex items-center gap-2 font-medium">
+                  <AlertTriangle className="h-4 w-4 shrink-0" />
+                  <span>
+                    检测到 {conflicts.length} 组已启用 Mod 存在相同资源 Hash 冲突：
+                    {conflicts
+                      .slice(0, 2)
+                      .map((g) => `${g.mods.join(" / ")}`)
+                      .join("；")}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const firstConflictMod = conflicts[0]?.mods[0];
+                    if (firstConflictMod) setPendingFocusMod({ characterName, modName: firstConflictMod });
+                  }}
+                  className="rounded-lg bg-[var(--danger)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90"
+                >
+                  定位冲突 Mod
+                </button>
+              </div>
+            )}
+          </header>
+          <div ref={modList} className="min-h-0 flex-1 overflow-y-auto px-3 py-3.5 xl:px-5">
+            {displayMods.length === 0 ? (
+              <div className="glass-card mx-auto mt-10 max-w-md rounded-2xl p-6 text-center">
+                <p className="text-sm font-semibold text-[var(--text-primary)]">
+                  {loading ? "正在读取 Mod…" : "暂无符合条件的 Mod"}
+                </p>
+                <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                  可尝试切换「全部外观」、清除搜索或标签筛选条件。
+                </p>
+              </div>
+            ) : (
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                onDragEnd={handleDragEnd}
+              >
+                <SortableContext
+                  items={reorderableMods.map((m) => m.name)}
+                  strategy={viewLayout === "list" ? verticalListSortingStrategy : rectSortingStrategy}
+                >
+                  <div
+                    className={viewLayout === "gallery"
+                      ? "mod-gallery grid gap-3.5 pb-4"
+                      : "grid gap-3 pb-4"}
+                  >
+                    {displayMods.map((item) => (
+                      <SortableModCard
+                        key={item.collection?.identity ?? item.name}
+                        item={item}
+                        selected={selectedModName === item.name}
+                        dndEnabled={dndEnabled && reorderableNames.has(item.name)}
+                        listLayout={viewLayout === "list"}
+                        tagColorMap={Object.fromEntries(tagPool.map((t) => [t.name, t.color]))}
+                        onSelect={() => selectMod(item.name)}
+                        onToggleEnable={() => void handleToggleMod(item.name, !item.enabled)}
+                        onSelectCollectionVariant={(identity, variantModName) => {
+                          setSelectedVariants((prev) => ({
+                            ...prev,
+                            [identity]: variantModName,
+                          }));
+                          selectMod(variantModName);
+                        }}
+                        onContextMenu={(e) => handleModContextMenu(e, item)}
+                      />
+                    ))}
+                  </div>
+                </SortableContext>
+              </DndContext>
+            )}
+          </div>
+        </section>
+
+        {/* Mod detail pane */}
+        <div
+          className="mod-detail-reveal"
+          data-open={showDetail}
+          data-resizing={resizing}
+          inert={!showDetail}
+        >
+          <div className="mod-detail-inner flex h-full">
+            <div className="relative flex w-6 shrink-0 flex-col items-center justify-center gap-1">
+              <button
+                type="button"
+                ref={collapseDetailRef}
+                onClick={() => changeDetailVisibility(false)}
+                aria-expanded={true}
+                aria-controls="mod-detail-panel"
+                aria-label="收起详情"
+                title="收起详情"
+                className="glass-surface grid h-8 w-5 place-items-center rounded-full text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
+              >
+                <PanelRightClose size={13} />
+              </button>
+          <div
+            role="separator"
+            tabIndex={0}
+            aria-label="调整 Mod 详情比例"
+            aria-orientation="vertical"
+            aria-controls="mod-detail-panel"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(detailShare * 100)}
+            aria-valuetext={"详情占 " + Math.round(detailShare * 100) + "%"}
+            onPointerDown={(e) => {
+              if (e.button !== 0) return;
+              e.preventDefault();
+              const width = detailPanel.current?.offsetWidth;
+              if (!width) return;
+              resizeStart.current = { x: e.clientX, width };
+              setResizing(true);
+              e.currentTarget.setPointerCapture(e.pointerId);
+            }}
+            onPointerMove={(e) => {
+              const start = resizeStart.current;
+              if (start) resizeWidth(start.width + start.x - e.clientX);
+            }}
+            onLostPointerCapture={() => {
+              resizeStart.current = null;
+              setResizing(false);
+            }}
+            onDoubleClick={() => setDetailShare(DEFAULT_DETAIL_SHARE)}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+                e.preventDefault();
+                const width = detailPanel.current?.offsetWidth;
+                if (width) resizeWidth(width + (e.key === "ArrowLeft" ? 24 : -24));
+              }
+            }}
+            title="拖动调整详情宽度，双击复位"
+            className="group grid h-10 w-5 cursor-col-resize touch-none place-items-center rounded outline-offset-[-2px] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+          >
+            <span className="h-7 w-1 rounded-full bg-[var(--border-strong)] transition-colors group-hover:bg-[var(--accent)]" />
+          </div>
+            </div>
+          <aside
+            id="mod-detail-panel"
+            ref={detailPanel}
+            aria-label="Mod 详情"
+            aria-busy={detailsLoading}
+            className="mod-detail-pane glass-surface flex h-full min-w-0 flex-1 flex-col overflow-hidden rounded-3xl"
+          >
+            {detailMod ? <>
             {/* Scrollable Body */}
-            <div className="flex-1 space-y-4 overflow-y-auto p-4">
+            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3.5 xl:space-y-5 xl:p-5">
               {/* Large Preview Image */}
-              <div className="group relative aspect-[16/10] w-full overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)]">
+              <div
+                data-preview-drop-target={detailMod.name}
+                title="可拖入图片或粘贴剪贴板图片以更换预览"
+                className="mod-detail-preview group relative w-full overflow-hidden rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)]"
+              >
                 {detailPreviewUrl ? (
-                  <img
-                    src={detailPreviewUrl}
-                    alt={detailMod.name}
+                  <button
+                    type="button"
+                    aria-label={`放大预览图：${detailMod.name}`}
                     onClick={() => setLightboxOpen(true)}
-                    className="h-full w-full cursor-zoom-in object-cover"
-                  />
+                    className="h-full w-full cursor-zoom-in focus-visible:-outline-offset-2"
+                  >
+                    <img src={detailPreviewUrl} alt={detailMod.name} className="h-full w-full object-contain" />
+                  </button>
                 ) : (
-                  <div className="flex h-full w-full flex-col items-center justify-center gap-1.5 text-xs text-[var(--text-muted)]">
-                    <ImageIcon className="h-7 w-7 opacity-45" />
+                  <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-sm text-[var(--text-muted)]">
+                    <ImageIcon className="h-8 w-8 opacity-45" />
                     <span>暂无预览图</span>
                   </div>
                 )}
+                {previewDropTarget === detailMod.name && (
+                  <div className="pointer-events-none absolute inset-0 grid place-items-center border-2 border-dashed border-[var(--accent)] bg-[var(--bg-surface-strong)]/85 text-sm font-semibold text-[var(--accent)]">
+                    松开以更换预览图
+                  </div>
+                )}
 
-                <div className="absolute right-2 bottom-2 flex gap-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+                <div className="absolute right-3 bottom-3 flex gap-1.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
                   <button
                     type="button"
                     onClick={() => setCropModTarget(detailMod)}
-                    className="inline-flex items-center gap-1 rounded-lg bg-black/72 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-xs hover:bg-black/90"
+                    className="inline-flex min-h-8 items-center gap-1.5 rounded-lg bg-black/72 px-2.5 text-xs font-medium text-white backdrop-blur-xs hover:bg-black/90"
                   >
                     <Crop className="h-3 w-3" />
                     <span>裁剪换图</span>
@@ -1206,7 +1519,7 @@ export function ModView({ characterName }: ModViewProps) {
                   <button
                     type="button"
                     onClick={() => void handlePickDirectPreview(detailMod)}
-                    className="inline-flex items-center gap-1 rounded-lg bg-black/72 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-xs hover:bg-black/90"
+                    className="inline-flex min-h-8 items-center gap-1.5 rounded-lg bg-black/72 px-2.5 text-xs font-medium text-white backdrop-blur-xs hover:bg-black/90"
                   >
                     <ImageIcon className="h-3 w-3" />
                     <span>直选图片</span>
@@ -1214,10 +1527,10 @@ export function ModView({ characterName }: ModViewProps) {
                 </div>
               </div>
 
-              {/* Title + Rename Pencil (UX fix #7) + Bookmark + Pin */}
+              {/* Title and Mod actions */}
               <div className="flex items-start justify-between gap-2">
                 <div className="flex min-w-0 flex-1 items-start gap-1.5">
-                  <h2 className="break-all text-base font-bold text-[var(--text-primary)]">
+                  <h2 className="text-xl leading-tight font-bold text-[var(--text-primary)] [overflow-wrap:anywhere] xl:text-2xl">
                     {detailMod.name}
                   </h2>
                   <button
@@ -1227,7 +1540,7 @@ export function ModView({ characterName }: ModViewProps) {
                       setRenameTarget(detailMod);
                       setRenameValue(detailMod.name);
                     }}
-                    className="mt-0.5 shrink-0 rounded-lg p-1 text-[var(--text-muted)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
+                    className="shrink-0 rounded-lg p-2 text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
@@ -1241,7 +1554,7 @@ export function ModView({ characterName }: ModViewProps) {
                       await api.setModMarked(characterName, detailMod.name, !detailMod.marked);
                       bumpModsTick();
                     }}
-                    className={`rounded-lg p-1.5 transition-colors ${
+                    className={`rounded-lg p-2 transition-colors ${
                       detailMod.marked
                         ? "bg-amber-500/15 text-amber-500"
                         : "text-[var(--text-muted)] hover:bg-[var(--bg-elevated)]"
@@ -1256,7 +1569,7 @@ export function ModView({ characterName }: ModViewProps) {
                       await api.pinMod(characterName, detailMod.name, !detailMod.pinned);
                       bumpModsTick();
                     }}
-                    className={`rounded-lg p-1.5 transition-colors ${
+                    className={`rounded-lg p-2 transition-colors ${
                       detailMod.pinned
                         ? "bg-[var(--accent-soft)] text-[var(--accent)]"
                         : "text-[var(--text-muted)] hover:bg-[var(--bg-elevated)]"
@@ -1304,11 +1617,11 @@ export function ModView({ characterName }: ModViewProps) {
                               ...prev,
                               [activeDisplayItem.collection!.identity]: v.name,
                             }));
-                            setSelectedModName(v.name);
+                            selectMod(v.name);
                           }}
                           className={`rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors ${
                             active
-                              ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
+                              ? "border-[var(--accent)] bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                               : "border-[var(--border-subtle)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:border-[var(--border-strong)]"
                           }`}
                         >
@@ -1322,34 +1635,48 @@ export function ModView({ characterName }: ModViewProps) {
               )}
 
               {/* Appearance section selector */}
-              <div className="space-y-1">
-                <label className="text-[11px] font-semibold text-[var(--text-secondary)]">
+              <div className="flex flex-wrap items-center gap-2.5 rounded-xl border border-[var(--border-subtle)] p-3">
+                <label htmlFor="mod-detail-section" className="text-sm font-semibold text-[var(--text-primary)]">
                   所属外观分区
                 </label>
-                <select
+                <SelectMenu
+                  id="mod-detail-section"
+                  aria-label="所属外观分区"
                   value={detailMod.sectionId}
-                  onChange={async (e) => {
-                    try {
-                      await api.assignModSection(characterName, detailMod.name, e.target.value);
-                      bumpModsTick();
-                    } catch (err) {
-                      addToast("error", String(err));
-                    }
-                  }}
-                  className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs text-[var(--text-primary)]"
-                >
-                  {sections.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(sectionId) => void assignSection(detailMod, sectionId)}
+                  options={sections.map((section) => ({ value: section.id, label: section.name }))}
+                  className="min-w-28 flex-1"
+                />
               </div>
 
-              {/* Hotkeys (UX fix #7 Keyboard icon & #8 Disambiguation) */}
+              {/* Notes */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-sm font-semibold text-[var(--text-primary)]">
+                  <span>本地备注</span>
+                  {notesDraft !== detailMod.notes && (
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveNotes()}
+                      className="text-[var(--accent)] hover:underline"
+                    >
+                      点击保存
+                    </button>
+                  )}
+                </div>
+                <textarea
+                  rows={3}
+                  value={notesDraft}
+                  onChange={(e) => setNotesDraft(e.target.value)}
+                  onBlur={() => void handleSaveNotes()}
+                  placeholder="记录作者、搭配建议或注意事项（自动保存到本地 tags.json）..."
+                  className="w-full resize-none rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)]"
+                />
+              </div>
+
+              {/* Hotkeys */}
               <div className="space-y-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3">
                 <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-[var(--text-primary)]">
+                  <div className="flex items-center gap-1.5 text-sm font-semibold text-[var(--text-primary)]">
                     <Keyboard className="h-3.5 w-3.5 text-[var(--accent)]" />
                     <span>Mod 快捷键</span>
                   </div>
@@ -1365,9 +1692,9 @@ export function ModView({ characterName }: ModViewProps) {
                       return (
                         <div
                           key={`${hk.iniRelPath}-${hk.section}`}
-                          className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-2.5 py-2 text-xs"
+                          className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-2 text-sm"
                         >
-                          <div className="flex items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
                             {editingThis ? (
                               <div className="flex flex-1 items-center gap-1.5">
                                 <input
@@ -1385,21 +1712,21 @@ export function ModView({ characterName }: ModViewProps) {
                                 <button
                                   type="button"
                                   onClick={() => void handleSaveHotkeyAlias(hk.section)}
-                                  className="rounded-md bg-[var(--accent)] p-1 text-[var(--accent-contrast)]"
+                                  className="rounded-md bg-[var(--accent-fill)] p-1 text-[var(--accent-contrast)]"
                                 >
                                   <Check className="h-3 w-3" />
                                 </button>
                               </div>
                             ) : (
                               <>
-                                <span className="truncate font-medium text-[var(--text-primary)]">
+                                <span className="min-w-0 truncate font-medium text-[var(--text-primary)]" title={hk.alias || hk.description}>
                                   {hk.alias || hk.description}
                                 </span>
-                                <div className="flex shrink-0 items-center gap-1">
+                                <div className="flex min-w-0 flex-wrap items-center gap-1">
                                   {hk.keys.map((k, idx) => (
                                     <kbd
                                       key={`${k}-${idx}`}
-                                      className="rounded-md border border-[var(--border-strong)] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[var(--accent)]"
+                                      className="rounded-md border border-[var(--border-strong)] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-mono text-xs font-semibold text-[var(--accent)]"
                                     >
                                       {k}
                                     </kbd>
@@ -1431,7 +1758,7 @@ export function ModView({ characterName }: ModViewProps) {
                       );
                     })}
                     <p className="text-[10px] text-[var(--text-muted)]">
-                      提示：点击铅笔可重命名显示别名，点击键盘可录制并直接改写 `.ini` 键位（游戏内点按联动将在 Phase 3 接入）。
+                      铅笔编辑显示名称，键盘录制并更新 INI 快捷键。
                     </p>
                   </div>
                 ) : (
@@ -1443,7 +1770,7 @@ export function ModView({ characterName }: ModViewProps) {
 
               {/* Local Tags Editor */}
               <div className="space-y-2">
-                <div className="flex items-center justify-between text-[11px] font-semibold text-[var(--text-secondary)]">
+                <div className="flex items-center justify-between text-sm font-semibold text-[var(--text-primary)]">
                   <span className="inline-flex items-center gap-1.5">
                     <Tag className="h-3.5 w-3.5 text-[var(--accent)]" />
                     <span>本地标签</span>
@@ -1531,30 +1858,6 @@ export function ModView({ characterName }: ModViewProps) {
                 </div>
               </div>
 
-              {/* Notes */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-[11px] font-semibold text-[var(--text-secondary)]">
-                  <span>本地备注</span>
-                  {notesDraft !== detailMod.notes && (
-                    <button
-                      type="button"
-                      onClick={() => void handleSaveNotes()}
-                      className="text-[var(--accent)] hover:underline"
-                    >
-                      点击保存
-                    </button>
-                  )}
-                </div>
-                <textarea
-                  rows={3}
-                  value={notesDraft}
-                  onChange={(e) => setNotesDraft(e.target.value)}
-                  onBlur={() => void handleSaveNotes()}
-                  placeholder="记录作者、搭配建议或注意事项（自动保存到本地 tags.json）..."
-                  className="w-full resize-none rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-2.5 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)]"
-                />
-              </div>
-
               {/* Readme (说明.txt) */}
               {details?.readmeText && (
                 <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)]">
@@ -1583,14 +1886,14 @@ export function ModView({ characterName }: ModViewProps) {
             </div>
 
             {/* Sticky Bottom Action Bar (UX fix #6) */}
-            <div className="sticky bottom-0 flex shrink-0 items-center gap-2 border-t border-[var(--border-subtle)] bg-[var(--bg-surface-strong)] px-4 py-3">
+            <div className="sticky bottom-0 flex shrink-0 items-center gap-2 border-t border-[var(--border-subtle)] bg-[var(--bg-surface-strong)] p-3 xl:px-5">
               <button
                 type="button"
                 onClick={() => void handleToggleMod(detailMod.name, !detailMod.enabled)}
-                className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold whitespace-nowrap transition-colors ${
+                className={`flex min-h-10 flex-1 items-center justify-center gap-1.5 rounded-xl px-2.5 text-sm font-semibold whitespace-nowrap transition-colors ${
                   detailMod.enabled
                     ? "border border-[var(--border-strong)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-                    : "bg-[var(--accent)] text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+                    : "bg-[var(--accent-fill)] text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
                 }`}
               >
                 <Power className="h-3.5 w-3.5" />
@@ -1601,7 +1904,7 @@ export function ModView({ characterName }: ModViewProps) {
                 type="button"
                 title="在资源管理器中打开"
                 onClick={() => void api.openPathInExplorer(detailMod.path)}
-                className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-2 text-[var(--text-primary)] hover:border-[var(--border-strong)]"
+                className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--border-strong)]"
               >
                 <FolderOpen className="h-4 w-4" />
               </button>
@@ -1613,7 +1916,7 @@ export function ModView({ characterName }: ModViewProps) {
                   setMovingMod({ sourceCharacter: characterName, modName: detailMod.name });
                   setSelectedCharacter(null);
                 }}
-                className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-2 text-[var(--text-primary)] hover:border-[var(--border-strong)]"
+                className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-primary)] hover:border-[var(--border-strong)]"
               >
                 <FolderInput className="h-4 w-4" />
               </button>
@@ -1622,13 +1925,19 @@ export function ModView({ characterName }: ModViewProps) {
                 type="button"
                 title="移入回收站"
                 onClick={() => setDeleteTarget(detailMod)}
-                className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-2 text-[var(--danger)] hover:bg-[var(--danger-soft)]"
+                className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--danger)] hover:bg-[var(--danger-soft)]"
               >
                 <Trash2 className="h-4 w-4" />
               </button>
             </div>
+            </> : (
+              <div className="flex h-full items-center justify-center p-4 text-xs text-[var(--text-secondary)]">
+                {detailsLoading ? "正在读取 Mod 详情…" : "无法读取 Mod 详情"}
+              </div>
+            )}
           </aside>
-        )}
+          </div>
+        </div>
       </div>
 
       <ContextMenu menu={ctxMenu} onClose={() => setCtxMenu(null)} />
@@ -1678,7 +1987,7 @@ export function ModView({ characterName }: ModViewProps) {
               type="button"
               onClick={handleRenameConfirm}
               disabled={renaming}
-              className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
             >
               {renaming ? "保存中..." : "确认重命名"}
             </button>
@@ -1716,14 +2025,7 @@ export function ModView({ characterName }: ModViewProps) {
                 type="button"
                 onClick={async () => {
                   if (!assignSectionTarget) return;
-                  try {
-                    await api.assignModSection(characterName, assignSectionTarget.name, sec.id);
-                    addToast("success", `已分配到「${sec.name}」`);
-                    setAssignSectionTarget(null);
-                    bumpModsTick();
-                  } catch (err) {
-                    addToast("error", String(err));
-                  }
+                  if (await assignSection(assignSectionTarget, sec.id)) setAssignSectionTarget(null);
                 }}
                 className={`flex w-full items-center justify-between rounded-xl border px-3.5 py-2.5 text-xs font-medium ${
                   active
@@ -1762,7 +2064,7 @@ export function ModView({ characterName }: ModViewProps) {
                 setRabbitFxConfirm(null);
                 void handleToggleMod(modName, enable, true);
               }}
-              className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+              className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
             >
               禁用旧版并启用此版
             </button>
@@ -1889,7 +2191,7 @@ export function ModView({ characterName }: ModViewProps) {
         <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
           确定要重置
           <strong className="mx-1 text-[var(--text-primary)]">「{resetIniTarget?.name}」</strong>
-          的 INI 状态吗？系统将恢复其 `.qaqm-persistbak` 备份、清空对应 Persist Bridge 缓存并移除 `d3dx_user.ini` 中的历史变量记忆。
+          的 EFMM 持久化状态吗？系统将恢复其 EFMM INI 备份并清空对应的持久化缓存。
         </p>
       </Modal>
 

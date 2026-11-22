@@ -25,6 +25,7 @@ import type {
   ImportPlanItem,
 } from "../../types/mod";
 import { Modal } from "../ui/Modal";
+import { SelectMenu } from "../ui/SelectMenu";
 
 interface ImportWizardModalProps {
   open: boolean;
@@ -134,7 +135,7 @@ function CharacterSearchPicker({
                   }}
                   className={`truncate rounded-lg px-2 py-1 text-left text-[11px] transition-colors ${
                     active
-                      ? "bg-[var(--accent)] font-semibold text-[var(--accent-contrast)]"
+                      ? "bg-[var(--accent-fill)] font-semibold text-[var(--accent-contrast)]"
                       : "text-[var(--text-primary)] hover:bg-[var(--accent-soft)]"
                   }`}
                 >
@@ -280,7 +281,7 @@ export function ImportWizardModal({
     setQueuedPaths(initialSourcePaths);
 
     void api
-      .listCharacters()
+      .listCharacters(true)
       .then((list) => setCharacters(list))
       .catch(() => setCharacters([]));
 
@@ -455,7 +456,7 @@ export function ImportWizardModal({
                   void runAnalysis(queuedPaths, characterLockActive ? lockedCharacter : null)
                 }
                 disabled={analyzing || queuedPaths.length === 0}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
               >
                 <Sparkles className="h-3.5 w-3.5" />
                 <span>{analyzing ? "正在解压与智能分析..." : `下一步：解析 (${queuedPaths.length})`}</span>
@@ -485,7 +486,7 @@ export function ImportWizardModal({
                 type="button"
                 onClick={() => void handleExecuteImport()}
                 disabled={installing || activeImportCount === 0}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
               >
                 <Archive className="h-3.5 w-3.5" />
                 <span>{installing ? "正在写入 Mods 目录..." : `开始导入 (${activeImportCount} 项)`}</span>
@@ -505,7 +506,7 @@ export function ImportWizardModal({
               <button
                 type="button"
                 onClick={onClose}
-                className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+                className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
               >
                 完成并关闭
               </button>
@@ -526,7 +527,7 @@ export function ImportWizardModal({
               key={s.num}
               className={`rounded-lg px-2.5 py-1 font-medium ${
                 step === s.num
-                  ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                  ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                   : step > s.num
                   ? "bg-emerald-500/15 text-emerald-500"
                   : "bg-[var(--bg-elevated)] text-[var(--text-muted)]"
@@ -729,6 +730,11 @@ export function ImportWizardModal({
                           <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${conf.cls}`}>
                             {conf.label}
                           </span>
+                          {item.installDisabled && (
+                            <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
+                              安装后保持禁用
+                            </span>
+                          )}
                           {item.isDisguisedMp4 && (
                             <span className="rounded-md bg-purple-500/15 px-1.5 py-0.5 text-[10px] font-medium text-purple-400">
                               MP4 伪装解密
@@ -802,23 +808,19 @@ export function ImportWizardModal({
                         </div>
 
                         <div>
-                          <label className="mb-1 block text-[11px] text-[var(--text-secondary)]">
+                          <label id={`import-section-label-${item.itemId}`} htmlFor={`import-section-${item.itemId}`} className="mb-1 block text-[11px] text-[var(--text-secondary)]">
                             外观分区（可选）
                           </label>
-                          <select
+                          <SelectMenu
+                            id={`import-section-${item.itemId}`}
+                            aria-labelledby={`import-section-label-${item.itemId}`}
                             value={draft.targetSectionId}
-                            onChange={(e) =>
-                              updateItemPlan(item.itemId, { targetSectionId: e.target.value })
+                            onChange={(targetSectionId) =>
+                              updateItemPlan(item.itemId, { targetSectionId })
                             }
-                            className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
-                          >
-                            <option value="">默认 / 不指定分区</option>
-                            {charSections.map((sec) => (
-                              <option key={sec.id} value={sec.id}>
-                                {sec.name}
-                              </option>
-                            ))}
-                          </select>
+                            options={[{ value: "", label: "默认 / 不指定分区" }, ...charSections.map((sec) => ({ value: sec.id, label: sec.name }))]}
+                            className="w-full"
+                          />
                         </div>
                       </div>
                     )}

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { Window } from "@tauri-apps/api/window";
 import {
   AlertTriangle,
   Bookmark,
@@ -12,9 +13,23 @@ import {
   ShieldAlert,
   X,
 } from "lucide-react";
+import { Modal } from "../components/ui/Modal";
 import { api, buildMediaUrl } from "../lib/tauri";
-import type { AppConfig, CharacterItem, ModDetails, OverlayStateSnapshot } from "../types/mod";
+import type { AppConfig, CharacterItem, ModDetails, OverlayStateSnapshot, RabbitFxModEntry } from "../types/mod";
 import { applyThemeToDocument, getOverlayPanelBg } from "./themeSync";
+
+interface ToggleTarget {
+  characterName: string;
+  modName: string;
+  enable: boolean;
+  exclusive: boolean;
+}
+
+interface RabbitFxConfirmation {
+  target: ToggleTarget;
+  conflicts: RabbitFxModEntry[];
+  error: string | null;
+}
 
 export function SidePanelApp() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -23,29 +38,46 @@ export function SidePanelApp() {
   const [details, setDetails] = useState<ModDetails | null>(null);
   const [sentSection, setSentSection] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
+  const [togglePending, setTogglePending] = useState(false);
+  const [rabbitFxConfirm, setRabbitFxConfirm] = useState<RabbitFxConfirmation | null>(null);
+  const snapshotRef = useRef<OverlayStateSnapshot | null>(null);
+  const detailRequest = useRef(0);
+
+  const loadDetails = useCallback(async (snapshot: OverlayStateSnapshot | null) => {
+    const request = ++detailRequest.current;
+    if (snapshot?.sideMode !== "detail" || !snapshot.selectedCharacter || !snapshot.selectedModName) {
+      setDetails(null);
+      return;
+    }
+    try {
+      const next = await api.getModDetails(snapshot.selectedCharacter, snapshot.selectedModName);
+      if (request === detailRequest.current) setDetails(next);
+    } catch {
+      if (request === detailRequest.current) setDetails(null);
+    }
+  }, []);
+
+  const applySnapshot = useCallback((snapshot: OverlayStateSnapshot) => {
+    snapshotRef.current = snapshot;
+    setOverlayState(snapshot);
+    void loadDetails(snapshot);
+  }, [loadDetails]);
 
   const loadSnapshotAndData = useCallback(async () => {
     try {
       const [cfg, ov, chars] = await Promise.all([
         api.getConfig(),
         api.getOverlayState(),
-        api.listCharacters(),
+        api.listCharacters(true),
       ]);
       setConfig(cfg);
       applyThemeToDocument(cfg);
-      setOverlayState(ov);
       setCharacters(chars);
-
-      if (ov.sideMode === "detail" && ov.selectedCharacter && ov.selectedModName) {
-        const d = await api.getModDetails(ov.selectedCharacter, ov.selectedModName);
-        setDetails(d);
-      } else if (ov.sideMode !== "detail") {
-        setDetails(null);
-      }
+      if (!snapshotRef.current) applySnapshot(ov);
     } catch {
       // Ignore transient unavailable errors
     }
-  }, []);
+  }, [applySnapshot]);
 
   useEffect(() => {
     void loadSnapshotAndData();
@@ -66,39 +98,19 @@ export function SidePanelApp() {
       else cleanups.push(un1);
 
       const un2 = await listen<OverlayStateSnapshot>("overlay-state-changed", (ev) => {
-        if (!ev.payload) return;
-        setOverlayState(ev.payload);
-        if (
-          ev.payload.sideMode === "detail" &&
-          ev.payload.selectedCharacter &&
-          ev.payload.selectedModName
-        ) {
-          void api
-            .getModDetails(ev.payload.selectedCharacter, ev.payload.selectedModName)
-            .then(setDetails)
-            .catch(() => setDetails(null));
-        }
+        if (ev.payload) applySnapshot(ev.payload);
       });
       if (cancelled) un2();
       else cleanups.push(un2);
 
       const un3 = await listen("characters-changed", () => {
-        void api.listCharacters().then(setCharacters).catch(() => {});
+        void api.listCharacters(true).then(setCharacters).catch(() => {});
       });
       if (cancelled) un3();
       else cleanups.push(un3);
 
       const un4 = await listen("mods-changed", () => {
-        if (
-          overlayState?.sideMode === "detail" &&
-          overlayState.selectedCharacter &&
-          overlayState.selectedModName
-        ) {
-          void api
-            .getModDetails(overlayState.selectedCharacter, overlayState.selectedModName)
-            .then(setDetails)
-            .catch(() => {});
-        }
+        void loadDetails(snapshotRef.current);
       });
       if (cancelled) un4();
       else cleanups.push(un4);
@@ -107,18 +119,46 @@ export function SidePanelApp() {
     void setup();
     return () => {
       cancelled = true;
+      detailRequest.current += 1;
       for (const fn of cleanups) fn();
     };
-  }, [overlayState?.sideMode, overlayState?.selectedCharacter, overlayState?.selectedModName]);
+  }, [applySnapshot, loadDetails]);
 
-  const handleSendHotkey = async (section: string, rawExpr: string) => {
-    if (!config?.overlayClickableHotkeys) return;
+  const closeSidePanel = useCallback(async () => {
+    await Window.getByLabel("overlay")
+      .then((overlay) => overlay?.setFocus())
+      .catch(() => {});
+    try {
+      applySnapshot(await api.openOverlaySidePanel("closed"));
+    } catch (err) {
+      setStatusNote(String(err));
+    }
+  }, [applySnapshot]);
+
+  const sideMode = overlayState?.sideMode ?? "closed";
+  useEffect(() => {
+    if (sideMode !== "detail") setRabbitFxConfirm(null);
+  }, [sideMode]);
+
+  useEffect(() => {
+    if (sideMode === "closed" || rabbitFxConfirm) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing || e.repeat) return;
+      e.preventDefault();
+      void closeSidePanel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeSidePanel, rabbitFxConfirm, sideMode]);
+
+  const handleSendHotkey = async (key: string, rawExpr: string) => {
+    if (config?.overlayClickableHotkeys === false) return;
     try {
       await api.sendModHotkey(rawExpr);
-      setSentSection(section);
+      setSentSection(key);
       setStatusNote(`已向游戏发送 ${rawExpr}`);
       window.setTimeout(() => {
-        setSentSection((cur) => (cur === section ? null : cur));
+        setSentSection((cur) => (cur === key ? null : cur));
         setStatusNote(null);
       }, 1600);
     } catch (err) {
@@ -127,30 +167,40 @@ export function SidePanelApp() {
     }
   };
 
-  const handleToggleModInDetail = async () => {
-    if (!details) return;
-    const mod = details.modItem;
-    const map = config?.exclusiveByCategory ?? {};
-    const exclusive =
-      mod.characterName in map ? map[mod.characterName] : !["功能", "UI", "大世界", "武器"].includes(mod.characterName);
+  const toggleDetailMod = async (target: ToggleTarget, replaceRabbitFx = false) => {
+    if (togglePending) return;
+    const { characterName, modName, enable, exclusive } = target;
+    setTogglePending(true);
+    setStatusNote(null);
+    setRabbitFxConfirm((current) => current && { ...current, error: null });
     try {
-      const res = await api.toggleMod(mod.characterName, mod.name, !mod.enabled, exclusive, false);
+      const res = await api.toggleMod(characterName, modName, enable, exclusive, replaceRabbitFx);
       if (res.requiresRabbitFxConfirm) {
-        setStatusNote("存在已启用的 RabbitFX，请在左侧主浮窗中确认替换");
+        setRabbitFxConfirm({ target, conflicts: res.activeRabbitFx, error: null });
         return;
       }
-      if (res.success && config?.overlayAutoReload) {
+      if (!res.success) throw new Error(res.message ?? "无法切换 Mod");
+      setRabbitFxConfirm(null);
+      if (config?.overlayAutoReload) {
         void api.sendF10Reload().catch(() => {});
       }
-      const next = await api.getModDetails(mod.characterName, mod.name);
-      setDetails(next);
     } catch (err) {
-      setStatusNote(String(err));
+      const message = String(err);
+      if (replaceRabbitFx) {
+        setRabbitFxConfirm((current) => current && { ...current, error: message });
+      } else {
+        setStatusNote(message);
+      }
+    } finally {
+      setTogglePending(false);
     }
   };
 
-  const sideMode = overlayState?.sideMode ?? "closed";
-  const detailMod = details?.modItem ?? null;
+  const detailMod = details &&
+    details.modItem.characterName === overlayState?.selectedCharacter &&
+    details.modItem.name === overlayState.selectedModName
+      ? details.modItem
+      : null;
   const previewUrl = detailMod
     ? buildMediaUrl(detailMod.previewPath, detailMod.previewMtime)
     : null;
@@ -190,7 +240,7 @@ export function SidePanelApp() {
           <button
             type="button"
             title="收起侧边窗"
-            onClick={() => void api.openOverlaySidePanel("closed")}
+            onClick={() => void closeSidePanel()}
             className="rounded-lg p-1 text-[var(--text-secondary)] hover:bg-[var(--danger)] hover:text-white"
           >
             <X className="h-3.5 w-3.5" />
@@ -311,19 +361,15 @@ export function SidePanelApp() {
                 <div className="space-y-1.5">
                   {details.hotkeys.map((hk) => {
                     const interactive = hk.canApply && (config?.overlayClickableHotkeys ?? true);
-                    const wasSent = sentSection === hk.section;
+                    const key = `${hk.iniRelPath}:${hk.section}`;
+                    const wasSent = sentSection === key;
                     const primaryRaw = hk.rawKeys[0] ?? "";
                     return (
                       <div key={`${hk.iniRelPath}-${hk.section}`}>
                         <button
                           type="button"
                           disabled={!interactive}
-                          onClick={() => void handleSendHotkey(hk.section, primaryRaw)}
-                          onKeyDown={(e) => {
-                            if (interactive && e.key === "Enter") {
-                              void handleSendHotkey(hk.section, primaryRaw);
-                            }
-                          }}
+                          onClick={() => void handleSendHotkey(key, primaryRaw)}
                           className={`flex w-full items-center justify-between gap-2 rounded-lg border px-2.5 py-2 text-left transition-colors ${
                             interactive
                               ? "border-[var(--border-subtle)] bg-[var(--bg-surface)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
@@ -372,11 +418,20 @@ export function SidePanelApp() {
           <div className="shrink-0 border-t border-[var(--border-subtle)] p-3">
             <button
               type="button"
-              onClick={() => void handleToggleModInDetail()}
+              disabled={togglePending}
+              onClick={() => {
+                const category = characters.find((c) => c.name === detailMod.characterName);
+                void toggleDetailMod({
+                  characterName: detailMod.characterName,
+                  modName: detailMod.name,
+                  enable: !detailMod.enabled,
+                  exclusive: config?.exclusiveByCategory?.[detailMod.characterName] ?? !category?.isNonCharacterCategory,
+                });
+              }}
               className={`flex w-full items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-semibold ${
                 detailMod.enabled
                   ? "border border-[var(--border-strong)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-                  : "bg-[var(--accent)] text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+                  : "bg-[var(--accent-fill)] text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
               }`}
             >
               <Power className="h-3.5 w-3.5" />
@@ -389,6 +444,51 @@ export function SidePanelApp() {
           点击左侧任意 Mod 卡片查看详情
         </div>
       )}
+
+      <Modal
+        open={sideMode === "detail" && rabbitFxConfirm !== null}
+        onClose={() => {
+          if (!togglePending) setRabbitFxConfirm(null);
+        }}
+        title="替换 RabbitFX"
+        closeOnBackdrop={!togglePending}
+        footer={rabbitFxConfirm && (
+          <>
+            <button
+              type="button"
+              disabled={togglePending}
+              onClick={() => setRabbitFxConfirm(null)}
+              className="rounded-lg border border-[var(--border-subtle)] px-3 py-1.5 text-xs text-[var(--text-secondary)] disabled:opacity-50"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              disabled={togglePending}
+              onClick={() => void toggleDetailMod(rabbitFxConfirm.target, true)}
+              className="rounded-lg bg-[var(--accent-fill)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] disabled:opacity-50"
+            >
+              {togglePending ? "正在替换…" : "替换并启用"}
+            </button>
+          </>
+        )}
+      >
+        {rabbitFxConfirm && (
+          <div className="space-y-3 text-xs">
+            <p className="break-all">
+              启用「{rabbitFxConfirm.target.modName}」前需停用以下 RabbitFX，避免游戏崩溃。
+            </p>
+            <ul className="space-y-1 rounded-lg bg-[var(--bg-elevated)] p-2 text-[var(--text-secondary)]">
+              {rabbitFxConfirm.conflicts.map((mod) => (
+                <li className="break-all" key={mod.path}>{mod.characterName} / {mod.modName}</li>
+              ))}
+            </ul>
+            {rabbitFxConfirm.error && (
+              <p role="alert" className="break-all text-[var(--danger)]">{rabbitFxConfirm.error}</p>
+            )}
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

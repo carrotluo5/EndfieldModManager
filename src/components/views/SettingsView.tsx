@@ -1,14 +1,18 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
   AlertTriangle,
+  ArrowUpCircle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Database,
   Download,
+  ExternalLink,
   FolderOpen,
   FolderSync,
-  HardDriveDownload,
   Keyboard,
   PackageCheck,
   RefreshCw,
@@ -28,8 +32,21 @@ import type {
   GameRuntimeStatus,
   LaunchMode,
   PersistBridgeStatus,
+  UpdateCheckResult,
+  UpdateProgressEvent,
   XxmiConsistency,
 } from "../../types/mod";
+
+function formatUpdateBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "未知大小";
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
+}
 
 export function SettingsView() {
   const config = useAppStore((s) => s.config);
@@ -54,7 +71,6 @@ export function SettingsView() {
   const [consistency, setConsistency] = useState<XxmiConsistency | null>(null);
   const [checkingConsistency, setCheckingConsistency] = useState(false);
   const [detecting, setDetecting] = useState(false);
-  const [importingQaqm, setImportingQaqm] = useState(false);
 
   const [pbStatus, setPbStatus] = useState<PersistBridgeStatus | null>(null);
   const [pbBusy, setPbBusy] = useState(false);
@@ -62,6 +78,7 @@ export function SettingsView() {
 
   const [gameRuntime, setGameRuntime] = useState<GameRuntimeStatus | null>(null);
   const [hotkeyDraft, setHotkeyDraft] = useState(config?.overlayHotkey ?? "Alt+F");
+  const [hotkeyRegistered, setHotkeyRegistered] = useState<boolean | null>(null);
   const [overlayScaleDraft, setOverlayScaleDraft] = useState(config?.overlayScale ?? 1.0);
   const [overlayOpacityDraft, setOverlayOpacityDraft] = useState(config?.overlayOpacity ?? 90);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
@@ -69,6 +86,19 @@ export function SettingsView() {
   const [customFixerPath, setCustomFixerPath] = useState(config?.customFixerPath ?? "");
   const [pkgUpdating, setPkgUpdating] = useState(false);
   const [configTransferBusy, setConfigTransferBusy] = useState(false);
+
+  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updatingApp, setUpdatingApp] = useState(false);
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgressEvent | null>(null);
+  const [updateAdvancedOpen, setUpdateAdvancedOpen] = useState(false);
+  const [updateRepoDraft, setUpdateRepoDraft] = useState(
+    config?.updateRepo ?? "carrotluo5/EndfieldModManager"
+  );
+  const [updateMirrorDraft, setUpdateMirrorDraft] = useState(config?.updateMirrorPrefix ?? "");
+  const [updateTokenDraft, setUpdateTokenDraft] = useState(config?.updateGithubToken ?? "");
 
   useEffect(() => {
     if (!config) return;
@@ -81,6 +111,9 @@ export function SettingsView() {
     setOverlayScaleDraft(config.overlayScale);
     setOverlayOpacityDraft(config.overlayOpacity);
     setCustomFixerPath(config.customFixerPath ?? "");
+    setUpdateRepoDraft(config.updateRepo || "carrotluo5/EndfieldModManager");
+    setUpdateMirrorDraft(config.updateMirrorPrefix ?? "");
+    setUpdateTokenDraft(config.updateGithubToken ?? "");
   }, [config]);
 
   useEffect(() => {
@@ -88,6 +121,29 @@ export function SettingsView() {
       .getAutostartEnabled()
       .then((enabled) => setAutostartEnabled(enabled))
       .catch(() => {});
+    void api
+      .getAppVersion()
+      .then((v) => {
+        if (v) setAppVersion(v);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void listen<UpdateProgressEvent>("update-progress", (ev) => {
+      if (ev.payload) setUpdateProgress(ev.payload);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
   }, []);
 
   const loadGameRuntime = async () => {
@@ -102,6 +158,15 @@ export function SettingsView() {
   useEffect(() => {
     void loadGameRuntime();
   }, []);
+
+  useEffect(() => {
+    if (!config?.overlayHotkey) return;
+    let current = true;
+    void api.getOverlayHotkeyRegistered().then((registered) => {
+      if (current) setHotkeyRegistered(registered);
+    }).catch(() => {});
+    return () => { current = false; };
+  }, [config?.overlayHotkey]);
 
   const loadPersistBridgeStatus = async () => {
     try {
@@ -127,7 +192,7 @@ export function SettingsView() {
         "success",
         nextEnabled
           ? `Persist Bridge 已开启（挂载 ${status.activeStateCount} 份状态缓存），请重启游戏使其在游戏内生效`
-          : "Persist Bridge 已关闭，并已无损还原所有 .qaqm-persistbak 备份"
+          : "已关闭 Persist Bridge，并还原 Endfield Mod Manager 的 INI 备份"
       );
     } catch (err) {
       addToast("error", String(err));
@@ -267,30 +332,6 @@ export function SettingsView() {
     }
   };
 
-  const handleImportQaqm = async () => {
-    setImportingQaqm(true);
-    try {
-      const summary = await api.importFromQaqmanager();
-      await refreshPresetCount();
-      await refreshRabbitFxStatus();
-      bumpCharactersTick();
-      void runCheckConsistency();
-      const parts: string[] = [];
-      if (summary.importedPaths) parts.push("游戏与 Mods 路径");
-      if (summary.importedOrderCount > 0) parts.push(`${summary.importedOrderCount} 项排序`);
-      if (summary.importedPresetCount > 0) parts.push(`${summary.importedPresetCount} 个预设`);
-      if (parts.length > 0) {
-        addToast("success", `已从 QAQManager 只读迁移：${parts.join("、")}`);
-      } else {
-        addToast("info", summary.warnings[0] || "未发现新的可迁移项目");
-      }
-    } catch (err) {
-      addToast("error", String(err));
-    } finally {
-      setImportingQaqm(false);
-    }
-  };
-
   const handleOpenFolder = async (target: string) => {
     if (!target.trim()) return;
     try {
@@ -404,6 +445,79 @@ export function SettingsView() {
     }
   };
 
+  const handleSaveUpdateSettings = async () => {
+    try {
+      await updateConfigPatch({
+        updateRepo: updateRepoDraft.trim() || "carrotluo5/EndfieldModManager",
+        updateMirrorPrefix: updateMirrorDraft.trim(),
+        updateGithubToken: updateTokenDraft.trim(),
+      });
+      addToast("success", "GitHub 更新源配置已保存");
+    } catch (err) {
+      addToast("error", String(err));
+    }
+  };
+
+  const handleCheckUpdates = async () => {
+    if (checkingUpdate || updatingApp) return;
+    setCheckingUpdate(true);
+    setUpdateError(null);
+    try {
+      await updateConfigPatch({
+        updateRepo: updateRepoDraft.trim() || "carrotluo5/EndfieldModManager",
+        updateMirrorPrefix: updateMirrorDraft.trim(),
+        updateGithubToken: updateTokenDraft.trim(),
+      });
+      const res = await api.checkForUpdates();
+      setUpdateResult(res);
+      if (res.hasUpdate) {
+        addToast("success", `检测到新版本 v${res.latestVersion}`);
+      } else {
+        addToast("info", `当前已是最新版本 v${res.currentVersion}`);
+      }
+    } catch (err) {
+      const msg = String(err);
+      setUpdateError(msg);
+      addToast("error", msg);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleDownloadAndApplyUpdate = async () => {
+    if (!updateResult?.downloadUrl || !updateResult.canAutoUpdate || updatingApp) return;
+    setUpdatingApp(true);
+    setUpdateError(null);
+    setUpdateProgress({
+      stage: "downloading",
+      downloadedBytes: 0,
+      totalBytes: updateResult.fileSize || 0,
+      percent: 0,
+      message: "正在准备下载更新包...",
+    });
+    try {
+      await api.downloadAndApplyUpdate(
+        updateResult.downloadUrl,
+        updateResult.sha256 || null
+      );
+    } catch (err) {
+      const msg = String(err);
+      setUpdateError(msg);
+      addToast("error", `自动更新失败：${msg}`);
+      setUpdatingApp(false);
+    }
+  };
+
+  const handleOpenReleasesPage = async () => {
+    const repo = (updateRepoDraft.trim() || config?.updateRepo || "carrotluo5/EndfieldModManager").replace(/^\/+|\/+$/g, "");
+    const target = updateResult?.releaseUrl || `https://github.com/${repo}/releases`;
+    try {
+      await api.openExternalUrl(target);
+    } catch (err) {
+      addToast("error", String(err));
+    }
+  };
+
   return (
     <div className="h-full overflow-y-auto px-6 py-5">
       <div className="mx-auto max-w-4xl space-y-5 pb-8">
@@ -414,54 +528,28 @@ export function SettingsView() {
           </p>
         </div>
 
-        {/* Quick actions */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div className="glass-card rounded-2xl p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h2 className="text-sm font-semibold text-[var(--text-primary)]">
-                  自动检测本机路径
-                </h2>
-                <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                  扫描 XXMI 配置与常见盘符（EFMI\Mods、Endfield.exe、XXMI Launcher.exe）并自动填入空白项。
-                </p>
-              </div>
-              <Search className="h-5 w-5 shrink-0 text-[var(--accent)]" />
+        <section className="glass-card flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
+          <div className="flex items-start gap-3">
+            <Search className="mt-0.5 h-5 w-5 shrink-0 text-[var(--accent)]" />
+            <div>
+              <h2 className="text-sm font-semibold text-[var(--text-primary)]">
+                自动检测本机路径
+              </h2>
+              <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                扫描 XXMI 配置与常见盘符（EFMI\Mods、Endfield.exe、XXMI Launcher.exe）并自动填入空白项。
+              </p>
             </div>
-            <button
-              type="button"
-              onClick={handleAutoDetect}
-              disabled={detecting}
-              className="mt-3 inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
-            >
-              <Sparkles className="h-3.5 w-3.5" />
-              <span>{detecting ? "扫描中..." : "立即检测空白路径"}</span>
-            </button>
           </div>
-
-          <div className="glass-card rounded-2xl p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h2 className="text-sm font-semibold text-[var(--text-primary)]">
-                  从 QAQManager 一键只读迁移
-                </h2>
-                <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                  从 %APPDATA%\QAQManager 导入路径、角色/Mod 排序、外观分区与历史预设（仅读取，绝不修改原配置）。
-                </p>
-              </div>
-              <HardDriveDownload className="h-5 w-5 shrink-0 text-[var(--accent)]" />
-            </div>
-            <button
-              type="button"
-              onClick={handleImportQaqm}
-              disabled={importingQaqm}
-              className="mt-3 inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)] disabled:opacity-50"
-            >
-              <HardDriveDownload className="h-3.5 w-3.5" />
-              <span>{importingQaqm ? "迁移中..." : "一键只读迁移"}</span>
-            </button>
-          </div>
-        </div>
+          <button
+            type="button"
+            onClick={handleAutoDetect}
+            disabled={detecting}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            <span>{detecting ? "扫描中..." : "立即检测空白路径"}</span>
+          </button>
+        </section>
 
         {/* Setup Wizard, Offline Diagnostics, Safe Package Update & Backup */}
         <section className="glass-card space-y-4 rounded-2xl p-5">
@@ -494,7 +582,7 @@ export function SettingsView() {
             <button
               type="button"
               onClick={() => setSetupWizardOpen(true)}
-              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent-fill)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
             >
               <Wand2 className="h-3.5 w-3.5" />
               <span>打开 4 步初始化向导</span>
@@ -502,7 +590,7 @@ export function SettingsView() {
             <button
               type="button"
               onClick={() => setDiagnosticsOpen(true)}
-              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent-fill)] hover:text-[var(--accent-contrast)]"
             >
               <Activity className="h-3.5 w-3.5" />
               <span>8 项离线诊断</span>
@@ -616,11 +704,229 @@ export function SettingsView() {
               <button
                 type="button"
                 onClick={() => void handleSaveCustomFixer(customFixerPath)}
-                className="rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+                className="rounded-xl bg-[var(--accent-fill)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
               >
                 保存
               </button>
             </div>
+          </div>
+        </section>
+
+        {/* Software Version & GitHub Release Updater */}
+        <section className="glass-card space-y-4 rounded-2xl p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <ArrowUpCircle className="h-4 w-4 text-[var(--accent)]" />
+                <h2 className="text-sm font-semibold text-[var(--text-primary)]">
+                  软件版本与 GitHub 更新
+                </h2>
+                <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-0.5 text-[11px] font-semibold text-[var(--accent)] tabular-nums">
+                  当前 v{appVersion}
+                </span>
+              </div>
+              <p className="mt-0.5 text-xs text-[var(--text-secondary)]">
+                仅在您主动点击检查（或开启启动提示）时访问 GitHub Releases；热更新仅替换程序文件，完整保留本地 data / portable 配置。
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleOpenReleasesPage()}
+                className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-2 text-xs font-medium text-[var(--text-primary)] hover:border-[var(--border-strong)]"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                <span>打开 GitHub Releases</span>
+              </button>
+              <button
+                type="button"
+                disabled={checkingUpdate || updatingApp}
+                onClick={() => void handleCheckUpdates()}
+                className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent-fill)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${checkingUpdate ? "animate-spin" : ""}`} />
+                <span>{checkingUpdate ? "正在检查..." : "检查更新"}</span>
+              </button>
+            </div>
+          </div>
+
+          {updateError && (
+            <div className="flex items-start gap-2 rounded-xl border border-[var(--warning)]/40 bg-[var(--warning-soft)] px-3.5 py-2.5 text-xs text-[var(--warning)]">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span className="leading-relaxed">{updateError}</span>
+            </div>
+          )}
+
+          {updateResult && (
+            <div
+              className={`space-y-3 rounded-2xl border p-4 ${
+                updateResult.hasUpdate
+                  ? "border-[var(--accent)]/40 bg-[var(--accent-soft)]"
+                  : "border-[var(--success)]/35 bg-[var(--success-soft)]"
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-semibold text-[var(--text-primary)]">
+                  <CheckCircle2
+                    className={`h-4 w-4 shrink-0 ${
+                      updateResult.hasUpdate ? "text-[var(--accent)]" : "text-[var(--success)]"
+                    }`}
+                  />
+                  <span>
+                    {updateResult.hasUpdate
+                      ? `发现可用新版本：v${updateResult.latestVersion}（当前 v${updateResult.currentVersion}）`
+                      : `当前已是最新版本 v${updateResult.currentVersion}`}
+                  </span>
+                </div>
+                <span className="text-[11px] text-[var(--text-secondary)]">
+                  {updateResult.fileName} · {formatUpdateBytes(updateResult.fileSize)}
+                </span>
+              </div>
+
+              {updateResult.notes && (
+                <pre className="max-h-36 overflow-y-auto rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-3 text-xs leading-relaxed whitespace-pre-wrap text-[var(--text-primary)]">
+                  {updateResult.notes}
+                </pre>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--text-secondary)]">
+                <span className="truncate font-mono">
+                  {updateResult.sha256 ? `SHA-256: ${updateResult.sha256}` : `更新源: ${updateResult.source}`}
+                </span>
+                {updateResult.hasUpdate && updateResult.canAutoUpdate && (
+                  <button
+                    type="button"
+                    disabled={updatingApp || checkingUpdate}
+                    onClick={() => void handleDownloadAndApplyUpdate()}
+                    className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>{updatingApp ? "正在下载并更新..." : "立即下载并热更新重启"}</span>
+                  </button>
+                )}
+              </div>
+
+              {updateResult.hasUpdate && !updateResult.canAutoUpdate && (
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--warning)]/40 bg-[var(--warning-soft)] px-3.5 py-2.5 text-xs text-[var(--warning)]">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span className="leading-relaxed">
+                      当前版本 v{updateResult.currentVersion} 低于热更新最低要求（v
+                      {updateResult.minSupportedClientVersion}），请前往 GitHub
+                      下载完整便携包或安装包覆盖升级，您的 data / portable 配置不受影响。
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleOpenReleasesPage()}
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent-fill)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" />
+                    <span>前往 GitHub 下载完整版</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {updateProgress && (updatingApp || updateProgress.stage === "restarting") && (
+            <div className="space-y-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-[var(--text-primary)]">{updateProgress.message}</span>
+                <span className="font-mono text-[11px] text-[var(--text-secondary)] tabular-nums">
+                  {updateProgress.totalBytes > 0
+                    ? `${updateProgress.percent.toFixed(1)}% (${formatUpdateBytes(updateProgress.downloadedBytes)} / ${formatUpdateBytes(updateProgress.totalBytes)})`
+                    : formatUpdateBytes(updateProgress.downloadedBytes)}
+                </span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--bg-surface)]">
+                <div
+                  className="h-full rounded-full bg-[var(--accent-fill)] transition-[width] duration-150"
+                  style={{ width: `${Math.min(100, Math.max(4, updateProgress.percent))}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="border-t border-[var(--border-subtle)] pt-3">
+            <button
+              type="button"
+              onClick={() => setUpdateAdvancedOpen((v) => !v)}
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+            >
+              {updateAdvancedOpen ? (
+                <ChevronUp className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" />
+              )}
+              <span>更新源与高级设置</span>
+            </button>
+
+            {updateAdvancedOpen && (
+              <div className="mt-3 space-y-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3.5">
+                <label className="flex cursor-pointer items-center justify-between gap-3 text-xs">
+                  <span className="text-[var(--text-primary)]">
+                    启动时自动检查 GitHub 新版本提示（默认关闭，保持纯离线体验）
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(config?.autoCheckUpdates)}
+                    onChange={(e) => void updateConfigPatch({ autoCheckUpdates: e.target.checked })}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
+
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                  <div>
+                    <label className="mb-1 block text-[11px] text-[var(--text-secondary)]">
+                      GitHub 仓库（owner/repo）
+                    </label>
+                    <input
+                      type="text"
+                      value={updateRepoDraft}
+                      onChange={(e) => setUpdateRepoDraft(e.target.value)}
+                      placeholder="carrotluo5/EndfieldModManager"
+                      className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-xs text-[var(--text-primary)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] text-[var(--text-secondary)]">
+                      下载加速镜像前缀（可选，私有仓库使用 Token 时忽略）
+                    </label>
+                    <input
+                      type="text"
+                      value={updateMirrorDraft}
+                      onChange={(e) => setUpdateMirrorDraft(e.target.value)}
+                      placeholder="例如：https://ghproxy.net/"
+                      className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-xs text-[var(--text-primary)]"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-end gap-2">
+                  <div className="min-w-[220px] flex-1">
+                    <label className="mb-1 block text-[11px] text-[var(--text-secondary)]">
+                      GitHub Token（可选，用于私有仓库 Release 访问，明文保存在本地配置）
+                    </label>
+                    <input
+                      type="password"
+                      value={updateTokenDraft}
+                      onChange={(e) => setUpdateTokenDraft(e.target.value)}
+                      placeholder="ghp_... / github_pat_...（公开仓库留空即可）"
+                      className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-1.5 font-mono text-xs text-[var(--text-primary)]"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveUpdateSettings()}
+                    className="rounded-xl bg-[var(--accent-fill)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
+                  >
+                    保存更新设置
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </section>
 
@@ -631,7 +937,7 @@ export function SettingsView() {
             <button
               type="button"
               onClick={() => savePaths({ modsPath, gamePath, xxmiPath })}
-              className="rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+              className="rounded-xl bg-[var(--accent-fill)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
             >
               保存路径更改
             </button>
@@ -794,7 +1100,7 @@ export function SettingsView() {
                     onClick={() => updateConfigPatch({ launchMode: item.value })}
                     className={`rounded-lg py-1.5 text-xs font-medium transition-colors ${
                       config?.launchMode === item.value
-                        ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                        ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                         : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
                     }`}
                   >
@@ -852,7 +1158,7 @@ export function SettingsView() {
                 >
                   <span>{opt.label}</span>
                   {config?.closeBehavior === opt.value && (
-                    <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
+                    <span className="h-2 w-2 rounded-full bg-[var(--accent-fill)]" />
                   )}
                 </button>
               ))}
@@ -882,7 +1188,7 @@ export function SettingsView() {
                 onClick={() =>
                   void api.showOverlay().catch((err) => addToast("error", String(err)))
                 }
-                className="rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+                className="rounded-xl bg-[var(--accent-fill)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
               >
                 立即测试呼出浮窗
               </button>
@@ -935,17 +1241,23 @@ export function SettingsView() {
                     type="button"
                     onClick={async () => {
                       try {
-                        await api.setOverlayHotkey(hotkeyDraft);
-                        addToast("success", `局内呼出快捷键已更新为 ${hotkeyDraft}`);
+                        const saved = await api.setOverlayHotkey(hotkeyDraft);
+                        setHotkeyRegistered(true);
+                        addToast("success", `局内呼出快捷键已更新为 ${saved.overlayHotkey}`);
                       } catch (err) {
                         addToast("error", String(err));
                       }
                     }}
-                    className="rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
+                    className="rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent-fill)] hover:text-[var(--accent-contrast)]"
                   >
                     注册生效
                   </button>
                 </div>
+                {hotkeyRegistered === false && (
+                  <p role="status" className="mt-1.5 text-[11px] text-[var(--warning)]">
+                    {config?.overlayHotkey} 当前未注册。若快捷键已被其他应用占用，可换一个组合后注册。
+                  </p>
+                )}
               </div>
 
               <label className="block space-y-1.5 text-xs">
@@ -1036,14 +1348,19 @@ export function SettingsView() {
               <div className="flex items-center gap-2">
                 <Database className="h-4 w-4 text-[var(--accent)]" />
                 <h2 className="text-sm font-semibold text-[var(--text-primary)]">
-                  Persist Bridge 状态持久化桥接（兼容 QAQManager 格式）
+                  Persist Bridge 状态持久化
                 </h2>
               </div>
               <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-                将 Mod 的 <code className="rounded bg-[var(--bg-elevated)] px-1">global persist</code> 变量接管至{" "}
-                <code className="rounded bg-[var(--bg-elevated)] px-1">qaqm\cache\</code>，切换 Mod 禁用再重新启用后仍能保留模内服装搭配与滑块状态。切换总开关后需重启游戏生效；关闭时将通过{" "}
-                <code className="rounded bg-[var(--bg-elevated)] px-1">.qaqm-persistbak</code> 完整无损还原原始 INI。
+                Mod 的 <code className="rounded bg-[var(--bg-elevated)] px-1">global persist</code> 变量通过{" "}
+                <code className="rounded bg-[var(--bg-elevated)] px-1">efmm\cache\</code> 保存，以便切换 Mod 后恢复服装搭配和滑块状态。
+                切换总开关后需重启游戏。关闭时使用 <code className="rounded bg-[var(--bg-elevated)] px-1">.efmm-persistbak</code> 还原原始 INI。
               </p>
+              {pbStatus?.legacyConflict && (
+                <p className="text-xs leading-relaxed text-[var(--warning)]" role="status">
+                  此 Mod 库仍有旧版状态持久化。请先在原管理器中关闭该功能并还原 INI。
+                </p>
+              )}
             </div>
 
             <button
@@ -1053,7 +1370,7 @@ export function SettingsView() {
               className={`shrink-0 rounded-xl px-4 py-2 text-xs font-semibold transition-colors disabled:opacity-50 ${
                 config?.persistBridgeEnabled
                   ? "border border-[var(--border-strong)] bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-                  : "bg-[var(--accent)] text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+                  : "bg-[var(--accent-fill)] text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
               }`}
             >
               {pbBusy
@@ -1066,13 +1383,15 @@ export function SettingsView() {
 
           <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
             <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-xs">
-              <div className="text-[10px] text-[var(--text-muted)]">d3dx.ini 挂载</div>
+              <div className="text-[10px] text-[var(--text-muted)]">EFMM 挂载</div>
               <div
                 className={`mt-0.5 font-semibold ${
-                  pbStatus?.d3dxMounted ? "text-[var(--success)]" : "text-[var(--text-secondary)]"
+                  pbStatus?.d3dxMounted && pbStatus.enabled ? "text-[var(--success)]" : "text-[var(--text-secondary)]"
                 }`}
               >
-                {pbStatus?.d3dxMounted ? "已挂载 qaqm" : "未挂载"}
+                {pbStatus?.d3dxMounted
+                  ? pbStatus.enabled ? "状态持久化已挂载" : "仅挂载快捷键设置"
+                  : "未挂载"}
               </div>
             </div>
             <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-xs">
@@ -1088,7 +1407,7 @@ export function SettingsView() {
               </div>
             </div>
             <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-xs">
-              <div className="text-[10px] text-[var(--text-muted)]">原始备份 (.persistbak)</div>
+              <div className="text-[10px] text-[var(--text-muted)]">原始 INI 备份</div>
               <div className="mt-0.5 font-semibold tabular-nums text-[var(--text-primary)]">
                 {pbStatus?.backupFileCount ?? 0} 个
               </div>

@@ -1,11 +1,12 @@
 use crate::config::save_config;
 use crate::models::{AppConfig, NavigateToModPayload, OverlayStateSnapshot};
 use crate::AppState;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 pub const OVERLAY_LABEL: &str = "overlay";
 pub const SIDE_PANEL_LABEL: &str = "side-panel";
@@ -120,10 +121,11 @@ fn logical_side_width(side_mode: &str, detail_width: f64) -> f64 {
 }
 
 pub fn ensure_overlay_windows(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _build = state.overlay_window_build.lock().map_err(|_| "浮窗创建锁异常".to_string())?;
     let (scale, want_transparent, _) = read_scale_and_transparency(app);
 
     let (need_rebuild, side_mode, detail_w) = {
-        let state = app.state::<AppState>();
         let ov = state.overlay.lock().map_err(|_| "浮窗状态锁异常".to_string())?;
         let exists_both = app.get_webview_window(OVERLAY_LABEL).is_some()
             && app.get_webview_window(SIDE_PANEL_LABEL).is_some();
@@ -189,7 +191,6 @@ pub fn ensure_overlay_windows(app: &AppHandle) -> Result<(), String> {
     .build()
     .map_err(|e| format!("创建停靠侧边窗失败：{e}"))?;
 
-    let state = app.state::<AppState>();
     if let Ok(mut ov) = state.overlay.lock() {
         ov.built_transparent = want_transparent;
     }
@@ -318,15 +319,13 @@ pub fn hide_overlay(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn toggle_overlay(app: &AppHandle) -> Result<bool, String> {
-    let is_vis = {
+    let visible = {
         let state = app.state::<AppState>();
         let guard = state.overlay.lock().map_err(|_| "浮窗状态锁异常".to_string())?;
-        let win_visible = app
-            .get_webview_window(OVERLAY_LABEL)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false);
-        guard.visible && win_visible
+        guard.visible
     };
+    let is_vis = visible
+        && app.get_webview_window(OVERLAY_LABEL).is_some_and(|w| w.is_visible().unwrap_or(false));
 
     if is_vis {
         hide_overlay(app)?;
@@ -335,6 +334,15 @@ pub fn toggle_overlay(app: &AppHandle) -> Result<bool, String> {
         show_overlay(app)?;
         Ok(true)
     }
+}
+
+pub(crate) fn toggle_overlay_in_background(app: AppHandle) {
+    // Windows WebView2 window creation cannot run inside a native event callback.
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = toggle_overlay(&app) {
+            eprintln!("无法切换浮窗：{error}");
+        }
+    });
 }
 
 pub fn set_overlay_pinned(app: &AppHandle, pinned: bool) -> OverlayStateSnapshot {
@@ -527,20 +535,97 @@ pub fn schedule_blur_hide_check(app: AppHandle) {
 }
 
 pub fn register_overlay_hotkey(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
+    change_overlay_hotkey(app, hotkey_str, false).map(drop)
+}
+
+pub(crate) fn configured_hotkey_is_registered(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let shortcut = state.config.lock().ok().and_then(|cfg| cfg.overlay_hotkey.trim().parse::<Shortcut>().ok());
+    shortcut.is_some_and(|shortcut| app.global_shortcut().is_registered(shortcut))
+}
+
+pub(crate) fn set_overlay_hotkey(app: &AppHandle, hotkey_str: &str) -> Result<AppConfig, String> {
+    change_overlay_hotkey(app, hotkey_str, true)
+}
+
+fn change_overlay_hotkey(
+    app: &AppHandle,
+    hotkey_str: &str,
+    persist: bool,
+) -> Result<AppConfig, String> {
+    static ACTIVE_SHORTCUT: Mutex<Option<Shortcut>> = Mutex::new(None);
+
     let trimmed = hotkey_str.trim();
     if trimmed.is_empty() {
         return Err("局内呼出热键不能为空".to_string());
     }
+    let shortcut = trimmed
+        .parse::<Shortcut>()
+        .map_err(|e| format!("无效的局内呼出热键「{trimmed}」：{e}"))?;
+
+    let mut active = ACTIVE_SHORTCUT
+        .lock()
+        .map_err(|_| "热键锁异常".to_string())?;
+    let state = app.state::<AppState>();
+    // A settings update can finish before the startup worker registers its snapshot.
+    if !persist && active.is_some() {
+        return state
+            .config
+            .lock()
+            .map(|cfg| cfg.clone())
+            .map_err(|_| "配置锁异常".to_string());
+    }
 
     let gs = app.global_shortcut();
-    let _ = gs.unregister_all();
-    gs.on_shortcut(trimmed, |app_handle, _shortcut, event| {
-        if event.state() == ShortcutState::Pressed {
-            let h = app_handle.clone();
-            let _ = app_handle.run_on_main_thread(move || {
-                let _ = toggle_overlay(&h);
-            });
+    let newly_registered = !gs.is_registered(shortcut);
+    if newly_registered {
+        gs.on_shortcut(shortcut, |app_handle, fired, event| {
+            // The shortcut plugin can deliver events on the main thread while registration waits for it.
+            if event.state() == ShortcutState::Pressed
+                && ACTIVE_SHORTCUT
+                    .try_lock()
+                    .is_ok_and(|active| *active == Some(*fired))
+            {
+                toggle_overlay_in_background(app_handle.clone());
+            }
+        })
+        .map_err(|e| format!("注册全局快捷键「{trimmed}」失败：{e}"))?;
+    }
+
+    // Keep the previous shortcut registered until the candidate is registered and saved.
+    let updated = (|| {
+        let mut cfg = state.config.lock().map_err(|_| "配置锁异常".to_string())?;
+        if persist && cfg.overlay_hotkey != trimmed {
+            let mut next = cfg.clone();
+            next.overlay_hotkey = trimmed.to_string();
+            save_config(&next)?;
+            *cfg = next;
         }
-    })
-    .map_err(|e| format!("注册全局快捷键「{trimmed}」失败：{e}"))
+        Ok(cfg.clone())
+    })();
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(err) => {
+            if newly_registered {
+                if let Err(cleanup) = gs.unregister(shortcut) {
+                    return Err(format!("{err}。无法注销新快捷键「{trimmed}」：{cleanup}"));
+                }
+            }
+            return Err(err);
+        }
+    };
+
+    if let Some(previous) = active
+        .replace(shortcut)
+        .filter(|previous| *previous != shortcut)
+    {
+        if let Err(err) = gs.unregister(previous) {
+            eprintln!("无法注销旧快捷键「{previous}」：{err}");
+        }
+    }
+    if persist {
+        let _ = app.emit("settings-changed", &updated);
+        emit_overlay_state(app);
+    }
+    Ok(updated)
 }

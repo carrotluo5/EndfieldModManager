@@ -108,7 +108,7 @@ export function FixerModal({
             type="button"
             onClick={() => void handleRunFixer()}
             disabled={running}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
           >
             <Wrench className="h-3.5 w-3.5" />
             <span>{running ? "正在备份并执行修复..." : "立即创建备份并执行修复"}</span>
@@ -315,7 +315,7 @@ export function BackupRollbackModal({
                 type="button"
                 disabled={Boolean(restoringId)}
                 onClick={() => void handleRollback(entry.id)}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
                 <span>{restoringId === entry.id ? "还原中..." : "回滚此备份"}</span>

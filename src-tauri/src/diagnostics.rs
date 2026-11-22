@@ -52,7 +52,7 @@ fn check_d3dx_ini(efmi_root: &Path, persist_enabled: bool) -> (String, String, S
     let lower = raw.to_ascii_lowercase();
     let has_mods = lower.contains("include_recursive = mods") || lower.contains("include_recursive=mods");
     let has_excl = lower.contains("exclude_recursive = disabled") || lower.contains("exclude_recursive=disabled");
-    let has_qaqm = persist_bridge::is_d3dx_mounted(efmi_root);
+    let has_efmm = persist_bridge::is_d3dx_mounted(efmi_root);
 
     if !has_mods || !has_excl {
         return (
@@ -62,19 +62,19 @@ fn check_d3dx_ini(efmi_root: &Path, persist_enabled: bool) -> (String, String, S
             true,
         );
     }
-    if persist_enabled && !has_qaqm {
+    if persist_enabled && !has_efmm {
         return (
             "warn".to_string(),
-            "Persist Bridge 已开启但 d3dx.ini 尚未挂载 qaqm_includer.ini".to_string(),
-            "点击一键修复即可自动写入 include = qaqm\\qaqm_includer.ini。".to_string(),
+            "Persist Bridge 已开启但 d3dx.ini 尚未挂载独立状态目录".to_string(),
+            format!("点击修复即可写入 include = {}。", persist_bridge::BRIDGE_INCLUDE),
             true,
         );
     }
     (
         "ok".to_string(),
         "d3dx.ini 挂载配置正常".to_string(),
-        if has_qaqm {
-            "Mods 递归加载、DISABLED* 屏蔽及 qaqm_includer.ini 均已就位。".to_string()
+        if has_efmm {
+            "Mods 递归加载、DISABLED* 屏蔽及 EFMM 挂载规则均已就位。".to_string()
         } else {
             "Mods 递归加载与 DISABLED* 屏蔽规则完整有效。".to_string()
         },
@@ -336,17 +336,28 @@ pub fn run_offline_diagnostics(cfg: &AppConfig) -> DiagnosticsReport {
     if has_mods_root {
         let pb_status = persist_bridge::get_status(cfg);
         let efmi_root = mods_root.parent().unwrap_or(mods_root);
-        let keypress_ini = efmi_root.join("qaqm").join("qaqm_keypress.ini");
+        let keypress_ini = efmi_root.join(persist_bridge::BRIDGE_DIR).join(persist_bridge::KEYPRESS_FILE);
         let keypress_ok = fs::read_to_string(&keypress_ini)
             .map(|s| s.to_ascii_lowercase().contains("check_foreground_window = 0"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && pb_status.d3dx_mounted;
 
-        if !keypress_ok {
+        if let Some(conflict) = persist_bridge::legacy_bridge_conflict(cfg) {
             checks.push(make_check(
                 "persist_bridge_health",
                 "8. 后台热键与 Persist Bridge 健康状态",
                 "warn",
-                "qaqm_keypress.ini 尚未配置后台按键允许规则".to_string(),
+                "此 Mod 库仍有旧版状态持久化".to_string(),
+                conflict,
+                false,
+                "",
+            ));
+        } else if !keypress_ok {
+            checks.push(make_check(
+                "persist_bridge_health",
+                "8. 后台热键与 Persist Bridge 健康状态",
+                "warn",
+                "EFMM 尚未挂载后台按键允许规则".to_string(),
                 "点击一键修复可写入 check_foreground_window = 0，保障浮窗发送 F10 稳定生效。".to_string(),
                 true,
                 "fix",
@@ -357,8 +368,9 @@ pub fn run_offline_diagnostics(cfg: &AppConfig) -> DiagnosticsReport {
                 "8. 后台热键与 Persist Bridge 健康状态",
                 "warn",
                 format!(
-                    "Persist Bridge 已关闭，但仍残留 {} 份 .qaqm-persistbak 备份",
-                    pb_status.backup_file_count
+                    "Persist Bridge 已关闭，但仍残留 {} 份 {} 备份",
+                    pb_status.backup_file_count,
+                    persist_bridge::BACKUP_SUFFIX
                 ),
                 "点击一键修复可安全还原残留备份并清理状态文件。".to_string(),
                 true,
@@ -454,18 +466,21 @@ pub fn fix_diagnostic_item(cfg: &mut AppConfig, check_id: &str) -> Result<String
             fs::write(&d3dx, lines.join(eol).as_bytes())
                 .map_err(|e| format!("写回 d3dx.ini 失败：{e}"))?;
             if cfg.persist_bridge_enabled {
-                let _ = persist_bridge::ensure_d3dx_include(efmi_root);
+                crate::launcher::ensure_keypress_bridge(cfg)?;
             }
             Ok("已补全 d3dx.ini [Include] 挂载与屏蔽规则".to_string())
         }
         "persist_bridge_health" => {
-            crate::launcher::ensure_keypress_bridge(cfg);
-            let _ = persist_bridge::ensure_d3dx_include(efmi_root);
-            if !cfg.persist_bridge_enabled {
-                let _ = persist_bridge::disable_and_restore_all(cfg)?;
-                return Ok("已修复 qaqm_keypress.ini 并清理全部残留 .qaqm-persistbak 备份".to_string());
+            if let Some(conflict) = persist_bridge::legacy_bridge_conflict(cfg) {
+                return Err(conflict);
             }
-            Ok("已写入后台热键允许规则 qaqm_keypress.ini".to_string())
+            crate::launcher::ensure_keypress_bridge(cfg)?;
+            if !cfg.persist_bridge_enabled {
+                persist_bridge::disable_and_restore_all(cfg)?;
+                return Ok("已修复 EFMM 后台热键规则并还原 EFMM 的 INI 备份".to_string());
+            }
+            persist_bridge::sync_all_enabled_mods(cfg)?;
+            Ok("已写入 EFMM 后台热键规则并同步独立状态缓存".to_string())
         }
         _ => Err("该诊断项不支持自动修复".to_string()),
     }
@@ -474,8 +489,40 @@ pub fn fix_diagnostic_item(cfg: &mut AppConfig, check_id: &str) -> Result<String
 fn is_protected_package_top_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "mods" | "qaqm" | "d3dx_user.ini" | "xxmi launcher config.json" | "backup" | "backups"
+        "mods" | "efmm" | "qaqm" | "d3dx_user.ini" | "xxmi launcher config.json" | "backup" | "backups"
     )
+}
+
+fn validate_package_folder_update(source: &Path, target: &Path) -> Result<(), String> {
+    let source = source
+        .canonicalize()
+        .map_err(|err| format!("无法解析更新来源目录：{err}"))?;
+    let target = std::path::absolute(target)
+        .map_err(|err| format!("无法解析更新目标目录：{err}"))?;
+    let mut existing = target.as_path();
+    let canonical_target = loop {
+        match existing.canonicalize() {
+            Ok(resolved) => {
+                let suffix = target.strip_prefix(existing).unwrap_or(Path::new(""));
+                break resolved.join(suffix);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| format!("无法解析更新目标目录：{err}"))?;
+            }
+            Err(err) => return Err(format!("无法解析更新目标目录：{err}")),
+        }
+    };
+    #[cfg(windows)]
+    let (source, canonical_target) = (
+        PathBuf::from(source.to_string_lossy().to_lowercase()),
+        PathBuf::from(canonical_target.to_string_lossy().to_lowercase()),
+    );
+    if source.starts_with(&canonical_target) || canonical_target.starts_with(&source) {
+        return Err("请将更新来源和安装目标放在互不包含的两个目录中".to_string());
+    }
+    Ok(())
 }
 
 pub fn update_xxmi_or_efmi_package(
@@ -490,9 +537,7 @@ pub fn update_xxmi_or_efmi_package(
     }
 
     let target_root = if let Some(custom) = custom_dest_dir.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let p = PathBuf::from(custom);
-        fs::create_dir_all(&p).map_err(|e| format!("创建目标目录失败：{e}"))?;
-        p
+        PathBuf::from(custom)
     } else if target_kind == "efmi" {
         let mods = Path::new(&cfg.mods_path);
         mods.parent()
@@ -517,6 +562,10 @@ pub fn update_xxmi_or_efmi_package(
     } else {
         return Err("不支持的更新类型".to_string());
     };
+    if src.is_dir() {
+        validate_package_folder_update(&src, &target_root)?;
+    }
+    fs::create_dir_all(&target_root).map_err(|e| format!("创建目标目录失败：{e}"))?;
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -587,4 +636,73 @@ pub fn update_xxmi_or_efmi_package(
         skipped_protected_paths,
         message: format!("已安全更新核心文件 {copied_files} 个，用户 Mods 与配置已完整保留"),
     })
+}
+
+#[cfg(test)]
+mod package_update_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn test_root() -> PathBuf {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("efmm_package_update_test_{unique}"))
+    }
+
+    #[test]
+    fn folder_package_rejects_overlapping_targets_before_writing() {
+        let root = test_root();
+        let source = root.join("package");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("core.ini"), b"core files").unwrap();
+        let cfg = AppConfig::default();
+
+        let child = source.join("nested").join("install");
+        for target in [&source, &child, &root] {
+            let result = update_xxmi_or_efmi_package(
+                &cfg, "efmi", &source.to_string_lossy(), Some(&target.to_string_lossy()),
+            );
+            assert!(result.unwrap_err().contains("互不包含"));
+        }
+        assert!(!source.join("nested").exists());
+        assert!(!root.join("core.ini").exists());
+
+        let sibling = root.join("package-installed");
+        let result = update_xxmi_or_efmi_package(
+            &cfg, "efmi", &source.to_string_lossy(), Some(&sibling.to_string_lossy()),
+        ).unwrap();
+        assert_eq!(result.copied_files, 1);
+        assert_eq!(fs::read(sibling.join("core.ini")).unwrap(), b"core files");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_package_uses_explicit_target_and_preserves_mods() {
+        let root = test_root();
+        let old_install = root.join("old");
+        let target = root.join("selected");
+        fs::create_dir_all(old_install.join("Mods")).unwrap();
+        fs::create_dir_all(target.join("Mods")).unwrap();
+        fs::write(target.join("Mods").join("existing.txt"), b"keep").unwrap();
+        let archive = target.join("update.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("package/core.ini", options).unwrap();
+        writer.write_all(b"core files").unwrap();
+        writer.start_file("package/Mods/existing.txt", options).unwrap();
+        writer.write_all(b"replacement").unwrap();
+        writer.finish().unwrap();
+        let cfg = AppConfig {
+            mods_path: old_install.join("Mods").to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+
+        let result = update_xxmi_or_efmi_package(
+            &cfg, "efmi", &archive.to_string_lossy(), Some(&target.to_string_lossy()),
+        ).unwrap();
+        assert_eq!(result.copied_files, 1);
+        assert!(!old_install.join("core.ini").exists());
+        assert_eq!(fs::read(target.join("core.ini")).unwrap(), b"core files");
+        assert_eq!(fs::read(target.join("Mods").join("existing.txt")).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

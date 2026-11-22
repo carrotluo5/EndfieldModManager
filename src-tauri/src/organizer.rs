@@ -331,6 +331,9 @@ pub fn execute_organize_actions(
         let Ok(sm) = assert_safe_segment(&mod_name, "Mod 名称") else {
             continue;
         };
+        if sc.eq_ignore_ascii_case(&tc) {
+            continue;
+        }
         let src_char_dir = mods_root.join(&sc);
         let enabled_src = src_char_dir.join(&sm);
         let disabled_src = src_char_dir.join(format!("DISABLED_{sm}"));

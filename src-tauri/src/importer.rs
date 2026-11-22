@@ -1,8 +1,7 @@
 use crate::characters::{
     default_character_names, match_character_from_text, now_iso_utc,
 };
-use crate::config::save_config;
-use crate::fs_ops::assert_safe_segment;
+use crate::fs_ops::{assert_safe_segment, rename_dir_with_retry};
 use crate::ini_engine::{collect_ini_files, scan_mod_flags};
 use crate::models::{
     AppConfig, ImportAnalysisResponse, ImportAnalyzedItem, ImportExecutionSummary,
@@ -12,9 +11,10 @@ use crate::mods::{read_mod_tags_file, write_mod_tags_file};
 use crate::persist_bridge;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -29,10 +29,26 @@ pub const DISGUISE_XOR_KEY: [u8; 16] = [
 ];
 pub const DISGUISE_PASSWORD: &str = "qsl";
 const LARGE_ARCHIVE_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DISABLED_PREFIX: &str = "DISABLED_";
+pub(crate) const INSTALLED_MESSAGE: &str = "安装成功";
+
+struct StagedMod {
+    path: PathBuf,
+    install_disabled: bool,
+}
 
 pub struct ImportSession {
+    mods_path: String,
     pub temp_roots: Vec<PathBuf>,
-    pub staged_by_item_id: HashMap<String, PathBuf>,
+    staged_by_item_id: HashMap<String, StagedMod>,
+}
+
+impl ImportSession {
+    fn cleanup(self) {
+        for dir in self.temp_roots {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -41,13 +57,14 @@ pub struct ImportSessionStore {
 }
 
 impl ImportSessionStore {
+    fn take_session(&self, session_id: &str) -> Result<Option<ImportSession>, String> {
+        let mut sessions = self.sessions.lock().map_err(|_| "导入会话锁异常".to_string())?;
+        Ok(sessions.remove(session_id))
+    }
+
     pub fn cleanup_session(&self, session_id: &str) {
-        if let Ok(mut guard) = self.sessions.lock() {
-            if let Some(sess) = guard.remove(session_id) {
-                for dir in sess.temp_roots {
-                    let _ = fs::remove_dir_all(dir);
-                }
-            }
+        if let Ok(Some(session)) = self.take_session(session_id) {
+            session.cleanup();
         }
     }
 }
@@ -422,14 +439,19 @@ pub fn extract_archive_to_dir(
 
 pub fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("创建目标目录失败（{}）：{e}", dst.display()))?;
-    for entry in fs::read_dir(src).map_err(|e| format!("读取目录失败：{e}"))?.flatten() {
+    for entry in fs::read_dir(src).map_err(|e| format!("读取目录失败（{}）：{e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("读取目录项失败（{}）：{e}", src.display()))?;
         let s_path = entry.path();
         let d_path = dst.join(entry.file_name());
-        if s_path.is_dir() {
+        let file_type = entry.file_type()
+            .map_err(|e| format!("读取文件类型失败（{}）：{e}", s_path.display()))?;
+        if file_type.is_dir() {
             copy_dir_contents(&s_path, &d_path)?;
-        } else if s_path.is_file() {
+        } else if file_type.is_file() {
             fs::copy(&s_path, &d_path)
                 .map_err(|e| format!("复制文件失败（{}）：{e}", d_path.display()))?;
+        } else {
+            return Err(format!("无法复制符号链接或特殊文件：{}", s_path.display()));
         }
     }
     Ok(())
@@ -440,45 +462,83 @@ fn dir_contains_mod_markers(dir: &Path) -> bool {
         .max_depth(3)
         .into_iter()
         .flatten()
-        .any(|e| {
-            if !e.file_type().is_file() {
-                return false;
-            }
-            let low = e.file_name().to_string_lossy().to_ascii_lowercase();
-            (low.ends_with(".ini") && low != "desktop.ini") || low == "compiled.bin"
-        })
+        .any(|e| e.file_type().is_file() && is_mod_marker(&e.file_name().to_string_lossy()))
+}
+
+fn is_mod_marker(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.ends_with(".ini") && lower != "desktop.ini") || lower == "compiled.bin"
+}
+
+fn split_disabled_name(mut name: &str) -> (&str, bool) {
+    let original_name = name;
+    while name
+        .get(..DISABLED_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DISABLED_PREFIX))
+    {
+        name = &name[DISABLED_PREFIX.len()..];
+    }
+    (name, name.len() != original_name.len())
+}
+
+fn stage_import_mod(path: &Path, inspect_root: &Path, original_stem: &str) -> StagedMod {
+    let install_disabled = split_disabled_name(original_stem).1
+        || path.strip_prefix(inspect_root).is_ok_and(|relative| {
+            relative
+                .iter()
+                .any(|part| split_disabled_name(&part.to_string_lossy()).1)
+        });
+    StagedMod {
+        path: path.to_path_buf(),
+        install_disabled,
+    }
 }
 
 fn looks_like_modpack_root(dir: &Path) -> Option<PathBuf> {
-    // Pattern 1: root/Mods/<Char>/<Mod>
-    let mods_sub = dir.join("Mods");
-    if mods_sub.is_dir() {
-        return Some(mods_sub);
-    }
-    // Pattern 2: root has >= 2 character-named subdirectories whose children contain .ini files
     let known_chars: std::collections::HashSet<&str> = default_character_names()
         .iter()
         .map(|s| s.as_str())
         .collect();
-    let subdirs: Vec<PathBuf> = fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.path())
-        .collect();
-    let char_hits = subdirs
-        .iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(|n| known_chars.contains(n))
-                .unwrap_or(false)
-        })
-        .count();
-    if char_hits >= 2 {
-        return Some(dir.to_path_buf());
+    let mut level = dir.to_path_buf();
+    loop {
+        if level.file_name().is_some_and(|name| {
+            split_disabled_name(&name.to_string_lossy()).0.eq_ignore_ascii_case("Mods")
+        }) {
+            return Some(level);
+        }
+
+        let mut subdirs = Vec::new();
+        let mut char_hits = 0;
+        let mut has_mod_marker = false;
+        for entry in fs::read_dir(&level).ok()?.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if file_type.is_file() {
+                has_mod_marker |= is_mod_marker(&name);
+            } else if file_type.is_dir()
+                && !name.starts_with('.')
+                && !name.eq_ignore_ascii_case("__MACOSX")
+            {
+                let (clean_name, _) = split_disabled_name(&name);
+                if clean_name.eq_ignore_ascii_case("Mods") {
+                    return Some(entry.path());
+                }
+                char_hits += usize::from(known_chars.contains(clean_name));
+                subdirs.push(entry.path());
+            }
+        }
+
+        if char_hits >= 2 {
+            return Some(level);
+        }
+        if has_mod_marker || subdirs.len() != 1 {
+            return None;
+        }
+        level = subdirs.pop()?;
     }
-    None
 }
 
 fn list_existing_chars(mods_root: &Path) -> Vec<String> {
@@ -531,8 +591,7 @@ pub fn analyze_import_sources(
     let session_tmp = std::env::temp_dir().join(format!("efmm_import_{nanos}"));
     fs::create_dir_all(&session_tmp).map_err(|e| format!("创建临时导入目录失败：{e}"))?;
 
-    let temp_roots = vec![session_tmp.clone()];
-    let mut staged_by_item_id: HashMap<String, PathBuf> = HashMap::new();
+    let mut staged_by_item_id = HashMap::new();
     let mut items: Vec<ImportAnalyzedItem> = Vec::new();
     let mut skipped_messages: Vec<String> = Vec::new();
     let mut counter = 0usize;
@@ -585,6 +644,7 @@ pub fn analyze_import_sources(
         // Case A: Modpack (Mods/<Char>/<Mod> or multi-char folders)
         if locked_character.is_none() {
             if let Some(pack_root) = looks_like_modpack_root(&inspect_root) {
+                let previous_item_count = items.len();
                 if let Ok(char_entries) = fs::read_dir(&pack_root) {
                     for c_entry in char_entries.flatten() {
                         if !c_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -594,10 +654,11 @@ pub fn analyze_import_sources(
                         if c_name.starts_with('.') {
                             continue;
                         }
+                        let (c_name, _) = split_disabled_name(&c_name);
                         let resolved_char =
-                            match_character_from_text(&c_name, &existing_chars)
+                            match_character_from_text(c_name, &existing_chars)
                                 .map(|(zh, _)| zh)
-                                .unwrap_or_else(|| c_name.clone());
+                                .unwrap_or_else(|| c_name.to_string());
 
                         if let Ok(mod_entries) = fs::read_dir(c_entry.path()) {
                             for m_entry in mod_entries.flatten() {
@@ -608,10 +669,8 @@ pub fn analyze_import_sources(
                                 if m_dir_name.starts_with('.') {
                                     continue;
                                 }
-                                let clean_m_name = m_dir_name
-                                    .strip_prefix("DISABLED_")
-                                    .unwrap_or(&m_dir_name)
-                                    .to_string();
+                                let (clean_m_name, _) = split_disabled_name(&m_dir_name);
+                                let clean_m_name = clean_m_name.to_string();
                                 counter += 1;
                                 let item_id = format!("item_{counter}");
                                 let m_path = m_entry.path();
@@ -622,7 +681,9 @@ pub fn analyze_import_sources(
                                 } else {
                                     None
                                 };
-                                staged_by_item_id.insert(item_id.clone(), m_path.clone());
+                                let staged = stage_import_mod(&m_path, &inspect_root, &original_stem);
+                                let install_disabled = staged.install_disabled;
+                                staged_by_item_id.insert(item_id.clone(), staged);
                                 items.push(ImportAnalyzedItem {
                                     item_id,
                                     original_path: src_path.to_string_lossy().to_string(),
@@ -632,6 +693,7 @@ pub fn analyze_import_sources(
                                     suggested_character: Some(resolved_char.clone()),
                                     match_confidence: "high".to_string(),
                                     suggested_mod_name: clean_m_name,
+                                    install_disabled,
                                     is_eff_mod: is_eff,
                                     is_disguised_mp4: is_disguised,
                                     is_large_archive: is_large,
@@ -642,7 +704,7 @@ pub fn analyze_import_sources(
                         }
                     }
                 }
-                if !items.is_empty() {
+                if items.len() > previous_item_count {
                     continue;
                 }
             }
@@ -686,13 +748,11 @@ pub fn analyze_import_sources(
                     for mc in mod_children {
                         counter += 1;
                         let item_id = format!("item_{counter}");
-                        let cname = mc
+                        let folder_name = mc
                             .file_name()
                             .and_then(|s| s.to_str())
-                            .unwrap_or("Mod")
-                            .strip_prefix("DISABLED_")
-                            .unwrap_or_else(|| mc.file_name().and_then(|s| s.to_str()).unwrap_or("Mod"))
-                            .to_string();
+                            .unwrap_or("Mod");
+                        let cname = split_disabled_name(folder_name).0.to_string();
                         let inis = collect_ini_files(&mc);
                         let (_, _, is_eff) = scan_mod_flags(&mc, &inis);
                         let (sugg_char, conf) = if let Some(ref locked) = locked_character {
@@ -713,7 +773,9 @@ pub fn analyze_import_sources(
                         } else {
                             None
                         };
-                        staged_by_item_id.insert(item_id.clone(), mc.clone());
+                        let staged = stage_import_mod(&mc, &inspect_root, &original_stem);
+                        let install_disabled = staged.install_disabled;
+                        staged_by_item_id.insert(item_id.clone(), staged);
                         items.push(ImportAnalyzedItem {
                             item_id,
                             original_path: src_path.to_string_lossy().to_string(),
@@ -723,6 +785,7 @@ pub fn analyze_import_sources(
                             suggested_character: sugg_char,
                             match_confidence: conf,
                             suggested_mod_name: cname,
+                            install_disabled,
                             is_eff_mod: is_eff,
                             is_disguised_mp4: is_disguised,
                             is_large_archive: is_large,
@@ -738,10 +801,7 @@ pub fn analyze_import_sources(
         // Case C: Single Mod folder
         counter += 1;
         let item_id = format!("item_{counter}");
-        let clean_name = candidate_name
-            .strip_prefix("DISABLED_")
-            .unwrap_or(&candidate_name)
-            .to_string();
+        let clean_name = split_disabled_name(&candidate_name).0.to_string();
         let inis = collect_ini_files(&candidate_root);
         let (_, _, is_eff) = scan_mod_flags(&candidate_root, &inis);
 
@@ -766,7 +826,9 @@ pub fn analyze_import_sources(
             warnings.push("未在该目录内发现 .ini 文件，请确认是否为有效 Mod 目录".to_string());
         }
 
-        staged_by_item_id.insert(item_id.clone(), candidate_root.clone());
+        let staged = stage_import_mod(&candidate_root, &inspect_root, &original_stem);
+        let install_disabled = staged.install_disabled;
+        staged_by_item_id.insert(item_id.clone(), staged);
         items.push(ImportAnalyzedItem {
             item_id,
             original_path: src_path.to_string_lossy().to_string(),
@@ -776,6 +838,7 @@ pub fn analyze_import_sources(
             suggested_character: sugg_char,
             match_confidence: conf,
             suggested_mod_name: clean_name,
+            install_disabled,
             is_eff_mod: is_eff,
             is_disguised_mp4: is_disguised,
             is_large_archive: is_large,
@@ -788,16 +851,18 @@ pub fn analyze_import_sources(
         });
     }
 
-    let _ = temp_roots.len();
-    if let Ok(mut guard) = store.sessions.lock() {
-        guard.insert(
-            session_id.clone(),
-            ImportSession {
-                temp_roots,
-                staged_by_item_id,
-            },
-        );
-    }
+    let mut sessions = store.sessions.lock().map_err(|_| {
+        let _ = fs::remove_dir_all(&session_tmp);
+        "导入会话锁异常".to_string()
+    })?;
+    sessions.insert(
+        session_id.clone(),
+        ImportSession {
+            mods_path: cfg.mods_path.clone(),
+            temp_roots: vec![session_tmp],
+            staged_by_item_id,
+        },
+    );
 
     Ok(ImportAnalysisResponse {
         session_id,
@@ -806,18 +871,79 @@ pub fn analyze_import_sources(
     })
 }
 
-fn find_unique_mod_dir(char_dir: &Path, clean_mod_name: &str) -> (PathBuf, String) {
+fn find_unique_mod_dir(
+    char_dir: &Path,
+    clean_mod_name: &str,
+    install_disabled: bool,
+) -> (PathBuf, String) {
     let mut candidate = clean_mod_name.to_string();
     let mut idx = 2usize;
     loop {
         let enabled_path = char_dir.join(&candidate);
-        let disabled_path = char_dir.join(format!("DISABLED_{candidate}"));
+        let disabled_path = char_dir.join(format!("{DISABLED_PREFIX}{candidate}"));
         if !enabled_path.exists() && !disabled_path.exists() {
-            return (enabled_path, candidate);
+            let destination = if install_disabled {
+                disabled_path
+            } else {
+                enabled_path
+            };
+            return (destination, candidate);
         }
         candidate = format!("{clean_mod_name} ({idx})");
         idx += 1;
     }
+}
+
+fn install_staged_mod(
+    src_dir: &Path,
+    char_dir: &Path,
+    clean_mod_name: &str,
+    section_id: &str,
+    install_disabled: bool,
+) -> Result<(PathBuf, String), String> {
+    let canonical_src = fs::canonicalize(src_dir)
+        .map_err(|e| format!("无法打开导入源（{}）：{e}", src_dir.display()))?;
+    let canonical_char_dir = fs::canonicalize(char_dir)
+        .map_err(|e| format!("无法打开目标分类（{}）：{e}", char_dir.display()))?;
+    if canonical_char_dir.starts_with(&canonical_src) {
+        return Err("目标分类位于导入源内，请选择具体的 Mod 目录".to_string());
+    }
+
+    static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
+    let stage_id = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // The target directory and staging directory must share a volume for the final rename.
+    let stage = char_dir.join(format!("DISABLED_.efmm-import-{nanos}-{stage_id}"));
+    fs::create_dir(&stage).map_err(|e| format!("创建禁用暂存目录失败：{e}"))?;
+
+    let result = (|| {
+        copy_dir_contents(src_dir, &stage)?;
+        let sec = section_id.trim();
+        let mut tags_file = read_mod_tags_file(&stage);
+        tags_file.qaqm = Some(serde_json::json!({
+            "appearanceSectionId": if sec.is_empty() { "base" } else { sec },
+            "classificationSource": if sec.is_empty() || sec == "base" { "base-fallback" } else { "manual" },
+            "appearanceAssignedAt": now_iso_utc(),
+        }));
+        write_mod_tags_file(&stage, &mut tags_file)?;
+
+        let (dst_dir, final_mod_name) =
+            find_unique_mod_dir(char_dir, clean_mod_name, install_disabled);
+        rename_dir_with_retry(&stage, &dst_dir)?;
+        Ok((dst_dir, final_mod_name))
+    })();
+    if let Err(error) = &result {
+        if let Err(cleanup_error) = fs::remove_dir_all(&stage) {
+            return Err(format!(
+                "{error}。无法清理禁用暂存目录 {}：{cleanup_error}",
+                stage.display()
+            ));
+        }
+    }
+    result
 }
 
 pub fn execute_import_plan(
@@ -831,13 +957,13 @@ pub fn execute_import_plan(
         return Err("Mods 目录未配置或不存在".to_string());
     }
 
-    let staged_map = {
-        let guard = store.sessions.lock().map_err(|_| "导入会话锁异常".to_string())?;
-        guard
-            .get(session_id)
-            .map(|s| s.staged_by_item_id.clone())
-            .ok_or_else(|| "导入会话已过期或不存在".to_string())?
-    };
+    let session = store
+        .take_session(session_id)?
+        .ok_or_else(|| "导入会话已使用、已过期或不存在".to_string())?;
+    if session.mods_path != cfg.mods_path {
+        session.cleanup();
+        return Err("Mods 目录已变更，请返回上一步重新解析导入源".to_string());
+    }
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -862,7 +988,7 @@ pub fn execute_import_plan(
             continue;
         }
 
-        let Some(src_dir) = staged_map.get(&plan.item_id) else {
+        let Some(staged) = session.staged_by_item_id.get(&plan.item_id) else {
             failed_count += 1;
             results.push(ImportItemResult {
                 item_id: plan.item_id,
@@ -888,7 +1014,8 @@ pub fn execute_import_plan(
                 continue;
             }
         };
-        let safe_mod = match assert_safe_segment(&plan.target_mod_name, "Mod 名称") {
+        let clean_name = split_disabled_name(plan.target_mod_name.trim()).0;
+        let safe_mod = match assert_safe_segment(clean_name, "Mod 名称") {
             Ok(s) => s,
             Err(e) => {
                 failed_count += 1;
@@ -904,8 +1031,10 @@ pub fn execute_import_plan(
         };
 
         let char_dir = mods_root.join(&safe_char);
-        if !char_dir.exists() {
-            if let Err(e) = fs::create_dir_all(&char_dir) {
+        let char_dir_created = match fs::create_dir(&char_dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && char_dir.is_dir() => false,
+            Err(e) => {
                 failed_count += 1;
                 results.push(ImportItemResult {
                     item_id: plan.item_id,
@@ -916,34 +1045,36 @@ pub fn execute_import_plan(
                 });
                 continue;
             }
-        }
+        };
 
-        let (dst_dir, final_mod_name) = find_unique_mod_dir(&char_dir, &safe_mod);
-        if let Err(e) = copy_dir_contents(src_dir, &dst_dir) {
-            failed_count += 1;
-            results.push(ImportItemResult {
-                item_id: plan.item_id,
-                mod_name: final_mod_name,
-                target_character: safe_char,
-                success: false,
-                message: e,
-            });
-            continue;
-        }
-
-        // Write appearance section tag if specified
-        let sec = plan.target_section_id.trim();
-        let mut tags_file = read_mod_tags_file(&dst_dir);
-        tags_file.qaqm = Some(serde_json::json!({
-            "appearanceSectionId": if sec.is_empty() { "base" } else { sec },
-            "classificationSource": if sec.is_empty() || sec == "base" { "base-fallback" } else { "manual" },
-            "appearanceAssignedAt": now_iso_utc(),
-        }));
-        let _ = write_mod_tags_file(&dst_dir, &mut tags_file);
+        let (dst_dir, final_mod_name) =
+            match install_staged_mod(
+                &staged.path,
+                &char_dir,
+                &safe_mod,
+                &plan.target_section_id,
+                staged.install_disabled,
+            ) {
+                Ok(installed) => installed,
+                Err(e) => {
+                    if char_dir_created {
+                        let _ = fs::remove_dir(&char_dir);
+                    }
+                    failed_count += 1;
+                    results.push(ImportItemResult {
+                        item_id: plan.item_id,
+                        mod_name: safe_mod,
+                        target_character: safe_char,
+                        success: false,
+                        message: e,
+                    });
+                    continue;
+                }
+            };
 
         cfg.mod_added_at
             .insert(format!("{safe_char}/{final_mod_name}"), now_ms);
-        if cfg.persist_bridge_enabled {
+        if cfg.persist_bridge_enabled && !staged.install_disabled {
             persist_bridge::on_mod_enabled(cfg, &dst_dir);
         }
 
@@ -953,12 +1084,11 @@ pub fn execute_import_plan(
             mod_name: final_mod_name,
             target_character: safe_char,
             success: true,
-            message: "安装成功".to_string(),
+            message: INSTALLED_MESSAGE.to_string(),
         });
     }
 
-    let _ = save_config(cfg);
-    store.cleanup_session(session_id);
+    session.cleanup();
 
     Ok(ImportExecutionSummary {
         installed_count,
@@ -966,4 +1096,242 @@ pub fn execute_import_plan(
         failed_count,
         results,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("efmm_import_test_{label}_{nanos}"));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn empty_pack_candidate_falls_back_after_other_import_items() {
+        let root = temp_dir("fallthrough");
+        let direct = root.join("First Skin");
+        let mixed = root.join("Second Skin");
+        fs::create_dir(&direct).unwrap();
+        fs::create_dir_all(mixed.join("Mods")).unwrap();
+        fs::write(direct.join("mod.ini"), "[Constants]").unwrap();
+        fs::write(mixed.join("mod.ini"), "[Constants]").unwrap();
+
+        let store = ImportSessionStore::default();
+        let analysis = analyze_import_sources(
+            &AppConfig::default(),
+            &store,
+            vec![
+                direct.to_string_lossy().into_owned(),
+                mixed.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
+        .unwrap();
+        store.cleanup_session(&analysis.session_id);
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(analysis.items.len(), 2);
+        assert_eq!(analysis.items[1].display_name, "Second Skin");
+        assert_eq!(analysis.items[1].import_kind, "single");
+    }
+
+    #[test]
+    fn metadata_failure_leaves_no_active_mod_or_staging_directory() {
+        let root = temp_dir("staging");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("tags.json")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("mod.ini"), "[Constants]").unwrap();
+
+        let error = install_staged_mod(&source, &target, "Skin", "base", false).unwrap_err();
+        assert!(error.contains("写入 tags.json 失败"), "{error}");
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
+
+        fs::remove_dir(source.join("tags.json")).unwrap();
+        let (installed, name) = install_staged_mod(&source, &target, "Skin", "base", false).unwrap();
+        assert_eq!(name, "Skin");
+        assert!(installed.join("mod.ini").is_file());
+        assert!(installed.join("tags.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wrapped_archive_and_folder_preserve_disabled_mods_and_existing_copies() {
+        let root = temp_dir("wrapped-pack");
+        let folder = root.join("Folder Input");
+        let folder_mod = folder.join("Wrapper/Mods/佩丽卡/dIsAbLeD_Skin");
+        fs::create_dir_all(&folder_mod).unwrap();
+        fs::write(folder_mod.join("mod.ini"), "[Constants]\n; folder").unwrap();
+
+        let archive = root.join("Archive Input.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, contents) in [
+            ("Readme.txt", "Package notes"),
+            (
+                "Wrapper/Outer/Mods/佩丽卡/disabled_Archived Skin/mod.ini",
+                "[Constants]\n; disabled archive mod",
+            ),
+            (
+                "Wrapper/Outer/Mods/佩丽卡/Active Skin/mod.ini",
+                "[Constants]\n; active archive mod",
+            ),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(contents.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let mods_path = root.join("Target Mods");
+        let target = mods_path.join("佩丽卡");
+        fs::create_dir_all(target.join("Skin")).unwrap();
+        fs::create_dir(target.join("DISABLED_Skin (2)")).unwrap();
+        fs::write(target.join("Skin/mod.ini"), "[Constants]\n; existing").unwrap();
+
+        let store = ImportSessionStore::default();
+        let mut cfg = AppConfig {
+            mods_path: mods_path.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let analysis = analyze_import_sources(
+            &cfg,
+            &store,
+            vec![
+                archive.to_string_lossy().into_owned(),
+                folder.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(analysis.items.len(), 3);
+        for item in &analysis.items {
+            assert_eq!(item.import_kind, "modpack");
+            assert_eq!(item.suggested_character.as_deref(), Some("佩丽卡"));
+            assert_eq!(item.install_disabled, item.display_name != "Active Skin");
+            assert!(!split_disabled_name(&item.display_name).1);
+        }
+
+        let plans = analysis
+            .items
+            .into_iter()
+            .map(|item| ImportPlanItem {
+                item_id: item.item_id,
+                target_character: item.suggested_character.unwrap(),
+                target_mod_name: item.suggested_mod_name,
+                target_section_id: "base".to_string(),
+                import_kind: item.import_kind,
+                skip: false,
+            })
+            .collect();
+        let summary = execute_import_plan(&mut cfg, &store, &analysis.session_id, plans).unwrap();
+
+        assert_eq!(summary.installed_count, 3);
+        assert!(summary.results.iter().any(|item| item.mod_name == "Skin (3)"));
+        assert!(cfg.mod_added_at.contains_key("佩丽卡/Skin (3)"));
+        assert!(!target.join("Skin (3)").exists());
+        assert!(target.join("DISABLED_Skin (3)/mod.ini").is_file());
+        assert!(target.join("DISABLED_Skin (2)").is_dir());
+        assert_eq!(
+            fs::read_to_string(target.join("Skin/mod.ini")).unwrap(),
+            "[Constants]\n; existing"
+        );
+        assert!(target.join("DISABLED_Archived Skin/mod.ini").is_file());
+        assert!(target.join("Active Skin/mod.ini").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disabled_single_zip_uses_inner_logical_name_and_stays_disabled() {
+        let root = temp_dir("disabled-single");
+        let archive = root.join("disabled_Outer.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&archive).unwrap());
+        zip.start_file("内层目录/mod.ini", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"[Constants]").unwrap();
+        zip.finish().unwrap();
+
+        let mods_path = root.join("Target Mods");
+        fs::create_dir(&mods_path).unwrap();
+        let store = ImportSessionStore::default();
+        let mut cfg = AppConfig {
+            mods_path: mods_path.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let analysis = analyze_import_sources(
+            &cfg,
+            &store,
+            vec![archive.to_string_lossy().into_owned()],
+            Some("佩丽卡".to_string()),
+        )
+        .unwrap();
+        let item = &analysis.items[0];
+        assert_eq!(item.suggested_mod_name, "内层目录");
+        assert!(item.install_disabled);
+
+        let summary = execute_import_plan(
+            &mut cfg,
+            &store,
+            &analysis.session_id,
+            vec![ImportPlanItem {
+                item_id: item.item_id.clone(),
+                target_character: "佩丽卡".to_string(),
+                target_mod_name: "DiSaBlEd_自定义名称".to_string(),
+                target_section_id: "base".to_string(),
+                import_kind: "single".to_string(),
+                skip: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(summary.results[0].mod_name, "自定义名称");
+        assert!(mods_path.join("佩丽卡/DISABLED_自定义名称/mod.ini").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_mods_root_requires_new_import_analysis() {
+        let root = temp_dir("changed-root");
+        let source = root.join("Skin");
+        let original_mods = root.join("Old Mods");
+        let current_mods = root.join("New Mods");
+        for dir in [&source, &original_mods, &current_mods] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::write(source.join("mod.ini"), "[Constants]").unwrap();
+
+        let store = ImportSessionStore::default();
+        let mut cfg = AppConfig {
+            mods_path: original_mods.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
+        let analysis = analyze_import_sources(
+            &cfg,
+            &store,
+            vec![source.to_string_lossy().into_owned()],
+            None,
+        )
+        .unwrap();
+        cfg.mods_path = current_mods.to_string_lossy().into_owned();
+        let error = execute_import_plan(
+            &mut cfg,
+            &store,
+            &analysis.session_id,
+            vec![ImportPlanItem {
+                item_id: analysis.items[0].item_id.clone(),
+                target_character: "佩丽卡".to_string(),
+                target_mod_name: "Skin".to_string(),
+                target_section_id: "base".to_string(),
+                import_kind: "single".to_string(),
+                skip: false,
+            }],
+        )
+        .unwrap_err();
+        assert!(error.contains("Mods 目录已变更"), "{error}");
+        assert!(fs::read_dir(&original_mods).unwrap().next().is_none());
+        assert!(fs::read_dir(&current_mods).unwrap().next().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

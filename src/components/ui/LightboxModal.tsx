@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { RotateCcw, X, ZoomIn, ZoomOut } from "lucide-react";
+import { useModalLayer } from "./Modal";
 
 interface LightboxModalProps {
   open: boolean;
@@ -11,21 +12,17 @@ interface LightboxModalProps {
 
 export function LightboxModal({ open, src, title, onClose }: LightboxModalProps) {
   const [scale, setScale] = useState(1);
+  const { backdropRef, panelRef } = useModalLayer(open && Boolean(src), onClose);
 
   useEffect(() => {
-    if (!open) return;
-    setScale(1);
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+    if (open) setScale(1);
+  }, [open, src]);
 
   if (!open || !src) return null;
 
   return createPortal(
     <div
+      ref={backdropRef}
       onMouseDown={onClose}
       onWheel={(e) => {
         e.preventDefault();
@@ -34,8 +31,16 @@ export function LightboxModal({ open, src, title, onClose }: LightboxModalProps)
           return Math.min(3.5, Math.max(0.5, Number(next.toFixed(2))));
         });
       }}
-      className="fixed inset-0 z-[75] flex flex-col bg-black/82 backdrop-blur-md"
+      className="fixed inset-0 z-50 bg-black/82 backdrop-blur-md"
     >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title || "图片预览"}
+        tabIndex={-1}
+        className="flex h-full flex-col outline-none"
+      >
       <div
         onMouseDown={(e) => e.stopPropagation()}
         className="flex items-center justify-between px-5 py-3 text-white"
@@ -88,6 +93,7 @@ export function LightboxModal({ open, src, title, onClose }: LightboxModalProps)
           style={{ transform: `scale(${scale})` }}
           className="max-h-full max-w-full rounded-lg object-contain shadow-2xl transition-transform duration-150"
         />
+      </div>
       </div>
     </div>,
     document.body

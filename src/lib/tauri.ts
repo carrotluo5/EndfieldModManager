@@ -25,12 +25,12 @@ import type {
   PresetImportResult,
   PresetListResponse,
   PresetModEntry,
-  QaqmImportSummary,
   RabbitFxStatus,
   TagsPoolStore,
   ToggleModResult,
   UndoEntrySummary,
   UndoResult,
+  UpdateCheckResult,
   XxmiConsistency,
 } from "../types/mod";
 
@@ -43,17 +43,18 @@ export function buildMediaUrl(path?: string | null, mtime?: number): string | nu
 export const api = {
   getConfig: () => invoke<AppConfig>("get_config"),
   updateConfig: (patch: Partial<AppConfig>) => invoke<AppConfig>("update_config", { patch }),
-  importFromQaqmanager: () => invoke<QaqmImportSummary>("import_from_qaqmanager"),
   getPresetCount: () => invoke<number>("get_preset_count"),
   getTagsPool: () => invoke<TagsPoolStore>("get_tags_pool"),
   saveTagsPool: (store: TagsPoolStore) => invoke<void>("save_tags_pool", { store }),
 
   autoDetectPaths: () => invoke<AutoDetectedPaths>("auto_detect_paths"),
-  checkXxmiConsistency: () => invoke<XxmiConsistency>("check_xxmi_consistency"),
+  checkXxmiConsistency: (paths?: Partial<Pick<AppConfig, "modsPath" | "xxmiPath">>) =>
+    invoke<XxmiConsistency>("check_xxmi_consistency", paths),
   launchGame: (mode?: string) => invoke<void>("launch_game", { mode: mode ?? null }),
   openPathInExplorer: (path: string) => invoke<void>("open_path_in_explorer", { path }),
 
-  listCharacters: () => invoke<CharacterItem[]>("list_characters"),
+  listCharacters: (includeAll?: boolean) =>
+    invoke<CharacterItem[]>("list_characters", { includeAll }),
   addCharacter: (name: string, coverDataUrl?: string | null) =>
     invoke<CharacterItem>("add_character", { name, coverDataUrl: coverDataUrl ?? null }),
   renameCharacter: (oldName: string, newName: string) =>
@@ -217,6 +218,7 @@ export const api = {
   sendModHotkey: (expr: string) => invoke<void>("send_mod_hotkey", { expr }),
 
   getOverlayState: () => invoke<OverlayStateSnapshot>("get_overlay_state"),
+  getOverlayHotkeyRegistered: () => invoke<boolean>("get_overlay_hotkey_registered"),
   showOverlay: () => invoke<void>("show_overlay"),
   hideOverlay: () => invoke<void>("hide_overlay"),
   toggleOverlay: () => invoke<boolean>("toggle_overlay"),
@@ -298,6 +300,15 @@ export const api = {
     invoke<void>("export_config_file", { filePath }),
   importConfigFile: (filePath: string) =>
     invoke<AppConfig>("import_config_file", { filePath }),
+
+  getAppVersion: () => invoke<string>("get_app_version"),
+  checkForUpdates: () => invoke<UpdateCheckResult>("check_for_updates"),
+  downloadAndApplyUpdate: (downloadUrl: string, expectedSha256?: string | null) =>
+    invoke<void>("download_and_apply_update", {
+      downloadUrl,
+      expectedSha256: expectedSha256 ?? null,
+    }),
+  openExternalUrl: (url: string) => invoke<void>("open_external_url", { url }),
 
   minimizeToTray: () => invoke<void>("minimize_to_tray"),
   quitApp: () => invoke<void>("quit_app"),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -16,12 +16,9 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import {
   Archive,
-  Eye,
-  EyeOff,
   FolderInput,
   FolderOpen,
   FolderSync,
-  HardDriveDownload,
   Image as ImageIcon,
   Pencil,
   Pin,
@@ -44,10 +41,34 @@ import { ContextMenu, type ContextMenuState } from "../ui/ContextMenu";
 import { ImageCropModal } from "../ui/ImageCropModal";
 import { Modal } from "../ui/Modal";
 
+const CHARACTER_SORT_KEY = "efmm.characterSort";
+const CHARACTER_SORT_OPTIONS = [
+  { value: "custom", label: "自定义" },
+  { value: "modCount", label: "Mod 数量" },
+  { value: "name", label: "名称" },
+] as const;
+const characterNameCollator = new Intl.Collator("zh-CN", { numeric: true });
+const characterControlClass =
+  "rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)] aria-pressed:bg-[var(--accent-soft)] aria-pressed:font-semibold aria-pressed:text-[var(--accent)]";
+
+type CharacterSortMode = (typeof CHARACTER_SORT_OPTIONS)[number]["value"];
+
+function readCharacterSort(): CharacterSortMode {
+  try {
+    const saved = localStorage.getItem(CHARACTER_SORT_KEY);
+    if (saved === "modCount" || saved === "name") return saved;
+  } catch {
+    // The view still works when browser storage is unavailable.
+  }
+  return "custom";
+}
+
 interface CharacterCardProps {
   item: CharacterItem;
   dndEnabled: boolean;
   isMoveTarget: boolean;
+  canDropCover: boolean;
+  coverDropActive: boolean;
   onClick: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }
@@ -56,12 +77,14 @@ function SortableCharacterCard({
   item,
   dndEnabled,
   isMoveTarget,
+  canDropCover,
+  coverDropActive,
   onClick,
   onContextMenu,
 }: CharacterCardProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: item.name,
-    disabled: !dndEnabled,
+    disabled: { draggable: !dndEnabled, droppable: !dndEnabled },
   });
 
   const style: React.CSSProperties = {
@@ -77,9 +100,17 @@ function SortableCharacterCard({
     <div
       ref={setNodeRef}
       style={style}
-      {...(dndEnabled ? attributes : {})}
+      data-cover-drop-target={canDropCover ? item.name : undefined}
+      {...(dndEnabled ? attributes : { role: "button", tabIndex: 0 })}
       {...(dndEnabled ? listeners : {})}
+      aria-label={item.name}
       onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          onClick();
+        }
+      }}
       onContextMenu={onContextMenu}
       className={`glass-card group relative aspect-[303/386] cursor-pointer overflow-hidden rounded-2xl transition-all hover:-translate-y-0.5 hover:border-[var(--border-strong)] ${
         isMoveTarget ? "ring-2 ring-[var(--accent)]" : ""
@@ -100,11 +131,16 @@ function SortableCharacterCard({
           <span className="mt-2 text-xs text-[var(--text-muted)]">暂无封面</span>
         </div>
       )}
+      {coverDropActive && (
+        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--bg-surface-strong)]/85 text-sm font-semibold text-[var(--accent)]">
+          松开以裁剪封面
+        </div>
+      )}
 
       {/* Top badges - NOTE: intentionally NO hover close/delete X button (UX fix #4) */}
       <div className="pointer-events-none absolute inset-x-2 top-2 flex items-start justify-between gap-1">
         {item.pinned ? (
-          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--accent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-contrast)] shadow-xs">
+          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--accent-fill)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-contrast)] shadow-xs">
             <Pin className="h-2.5 w-2.5" />
             <span>置顶</span>
           </span>
@@ -131,7 +167,7 @@ function SortableCharacterCard({
           <span
             className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold tabular-nums ${
               item.enabledCount > 0
-                ? "bg-[var(--accent)] text-[var(--accent-contrast)]"
+                ? "bg-[var(--accent-fill)] text-[var(--accent-contrast)]"
                 : "bg-white/20 text-white"
             }`}
           >
@@ -143,7 +179,13 @@ function SortableCharacterCard({
   );
 }
 
-export function CharactersView() {
+interface CharactersViewProps {
+  coverDropTarget: string | null;
+  droppedCover: { name: string; path: string } | null;
+  clearDroppedCover: () => void;
+}
+
+export function CharactersView({ coverDropTarget, droppedCover, clearDroppedCover }: CharactersViewProps) {
   const config = useAppStore((s) => s.config);
   const movingMod = useAppStore((s) => s.movingMod);
   const charactersTick = useAppStore((s) => s.charactersTick);
@@ -151,7 +193,6 @@ export function CharactersView() {
   const setMovingMod = useAppStore((s) => s.setMovingMod);
   const setActiveTab = useAppStore((s) => s.setActiveTab);
   const updateConfigPatch = useAppStore((s) => s.updateConfigPatch);
-  const refreshPresetCount = useAppStore((s) => s.refreshPresetCount);
   const refreshRabbitFxStatus = useAppStore((s) => s.refreshRabbitFxStatus);
   const bumpCharactersTick = useAppStore((s) => s.bumpCharactersTick);
   const bumpModsTick = useAppStore((s) => s.bumpModsTick);
@@ -163,7 +204,10 @@ export function CharactersView() {
 
   const [characters, setCharacters] = useState<CharacterItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const loadId = useRef(0);
+  const [savingOrder, setSavingOrder] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [sortMode, setSortMode] = useState(readCharacterSort);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
 
   // Add character modal
@@ -180,6 +224,17 @@ export function CharactersView() {
 
   // Change cover crop modal
   const [coverTarget, setCoverTarget] = useState<CharacterItem | null>(null);
+  const [coverSource, setCoverSource] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!droppedCover) return;
+    const item = characters.find((character) => character.name === droppedCover.name);
+    if (item) {
+      setCoverSource(buildMediaUrl(droppedCover.path, Date.now()));
+      setCoverTarget(item);
+    }
+    clearDroppedCover();
+  }, [characters, droppedCover, clearDroppedCover]);
 
   // Delete confirmation modal
   const [deleteTarget, setDeleteTarget] = useState<CharacterItem | null>(null);
@@ -196,18 +251,22 @@ export function CharactersView() {
   );
 
   const loadCharacters = useCallback(async () => {
+    const currentLoad = ++loadId.current;
     if (!config?.modsPath.trim()) {
       setCharacters([]);
+      setLoading(false);
       return;
     }
     setLoading(true);
     try {
-      const list = await api.listCharacters();
-      setCharacters(list);
+      const list = await api.listCharacters(true);
+      if (currentLoad === loadId.current) setCharacters(list);
     } catch (err) {
-      addToast("error", `加载角色列表失败：${String(err)}`);
+      if (currentLoad === loadId.current) {
+        addToast("error", `加载角色列表失败：${String(err)}`);
+      }
     } finally {
-      setLoading(false);
+      if (currentLoad === loadId.current) setLoading(false);
     }
   }, [config?.modsPath, addToast]);
 
@@ -215,45 +274,88 @@ export function CharactersView() {
     void loadCharacters();
   }, [loadCharacters, charactersTick]);
 
-  const showAll = config?.showAllCharacters ?? false;
+  const showAll = Boolean(config?.showAllCharacters || movingMod);
+  const normalizedQuery = searchQuery.trim();
 
   const visibleCharacters = useMemo(() => {
-    const q = searchQuery.trim();
-    return characters.filter((c) => {
-      if (!q && !showAll && c.modCount === 0 && !c.existsOnDisk && !c.pinned) {
-        return false;
+    const filtered = characters.filter(
+      (item) =>
+        (showAll || item.pinned || item.modCount > 0 || item.sectionCount > 0) &&
+        matchesSearch(item.name, item.aliases, normalizedQuery)
+    );
+    if (sortMode === "custom") return filtered;
+    return filtered.sort((left, right) => {
+      if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
+      if (sortMode === "modCount" && left.modCount !== right.modCount) {
+        return right.modCount - left.modCount;
       }
-      if (!q && !showAll && c.modCount === 0 && !c.pinned) {
-        return false;
-      }
-      return matchesSearch(c.name, c.aliases, q);
+      return characterNameCollator.compare(left.name, right.name);
     });
-  }, [characters, searchQuery, showAll]);
+  }, [characters, normalizedQuery, showAll, sortMode]);
 
-  const dndEnabled = !searchQuery.trim() && !movingMod;
+  const totalModCount = characters.reduce((sum, item) => sum + item.modCount, 0);
+  const visibleModCount = visibleCharacters.reduce((sum, item) => sum + item.modCount, 0);
+  const reorderableCharacters = visibleCharacters.filter((item) => !item.pinned);
+  const dndEnabled =
+    sortMode === "custom" && !normalizedQuery && !movingMod && !loading && !savingOrder;
+
+  const handleSortChange = (mode: CharacterSortMode) => {
+    setSortMode(mode);
+    try {
+      localStorage.setItem(CHARACTER_SORT_KEY, mode);
+    } catch {
+      // Keep the current selection for this view when storage is unavailable.
+    }
+  };
+
+  const handleShowAllChange = async (next: boolean) => {
+    if (movingMod || next === showAll) return;
+    try {
+      await updateConfigPatch({ showAllCharacters: next });
+    } catch (err) {
+      addToast("error", `保存角色显示设置失败：${String(err)}`);
+    }
+  };
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
-    if (!over || active.id === over.id) return;
+    if (!dndEnabled || !config || !over || active.id === over.id) return;
 
-    const oldIndex = visibleCharacters.findIndex((c) => c.name === active.id);
-    const newIndex = visibleCharacters.findIndex((c) => c.name === over.id);
+    const oldIndex = reorderableCharacters.findIndex((item) => item.name === active.id);
+    const newIndex = reorderableCharacters.findIndex((item) => item.name === over.id);
     if (oldIndex === -1 || newIndex === -1) return;
 
-    const reorderedVisible = arrayMove(visibleCharacters, oldIndex, newIndex);
-    const visibleSet = new Set(reorderedVisible.map((c) => c.name));
-    const hiddenNames = characters.filter((c) => !visibleSet.has(c.name)).map((c) => c.name);
-    const nextOrder = [...reorderedVisible.map((c) => c.name), ...hiddenNames];
+    const reordered = arrayMove(reorderableCharacters, oldIndex, newIndex);
+    const replacements = new Map(
+      reorderableCharacters.map((item, index) => [item.name, reordered[index]])
+    );
+    const nextCharacters = characters.map((item) => replacements.get(item.name) ?? item);
 
-    // Optimistic update
-    const charMap = new Map(characters.map((c) => [c.name, c]));
-    setCharacters(nextOrder.map((n) => charMap.get(n)!).filter(Boolean));
+    // Preserve pinned cards' saved positions so unpinning restores their custom order.
+    const characterNames = new Set(nextCharacters.map((item) => item.name));
+    const pinnedNames = new Set(nextCharacters.filter((item) => item.pinned).map((item) => item.name));
+    const slots = new Set(config.characterOrder.filter((name) => characterNames.has(name)));
+    nextCharacters.forEach((item) => slots.add(item.name));
+    const unpinned = nextCharacters.filter((item) => !item.pinned);
+    let unpinnedIndex = 0;
+    const nextOrder = Array.from(slots, (name) =>
+      pinnedNames.has(name) ? name : unpinned[unpinnedIndex++].name
+    );
 
+    setSavingOrder(true);
+    setCharacters(nextCharacters);
     try {
       await api.saveCharacterOrder(nextOrder);
+      useAppStore.setState((state) =>
+        state.config?.modsPath === config.modsPath
+          ? { config: { ...state.config, characterOrder: nextOrder } }
+          : {}
+      );
     } catch (err) {
       addToast("error", `保存角色排序失败：${String(err)}`);
       void loadCharacters();
+    } finally {
+      setSavingOrder(false);
     }
   };
 
@@ -454,22 +556,6 @@ export function CharactersView() {
     }
   };
 
-  const handleQuickImportQaqm = async () => {
-    try {
-      const summary = await api.importFromQaqmanager();
-      await refreshPresetCount();
-      await refreshRabbitFxStatus();
-      bumpCharactersTick();
-      if (summary.importedPaths) {
-        addToast("success", "已成功迁移 QAQManager 路径、排序与预设");
-      } else {
-        addToast("info", summary.warnings[0] || "未能迁移到有效的 Mods 路径");
-      }
-    } catch (err) {
-      addToast("error", String(err));
-    }
-  };
-
   if (!config?.modsPath.trim()) {
     return (
       <div className="flex h-full items-center justify-center p-6">
@@ -481,13 +567,13 @@ export function CharactersView() {
             欢迎使用 Endfield Mod Manager
           </h1>
           <p className="mt-2 text-xs leading-relaxed text-[var(--text-secondary)]">
-            尚未配置 EFMI 的 Mods 根目录。您可以自动探测本机路径、从旧版 QAQManager 一键只读迁移，或前往设置手动选择目录。
+            尚未配置 EFMI 的 Mods 根目录。可以自动检测本机路径，或前往设置选择目录。
           </p>
           <div className="mt-5 flex flex-wrap justify-center gap-2.5">
             <button
               type="button"
               onClick={() => setSetupWizardOpen(true)}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
             >
               <Wand2 className="h-3.5 w-3.5" />
               <span>打开 4 步初始化向导</span>
@@ -499,14 +585,6 @@ export function CharactersView() {
             >
               <Search className="h-3.5 w-3.5" />
               <span>自动检测路径</span>
-            </button>
-            <button
-              type="button"
-              onClick={handleQuickImportQaqm}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-4 py-2 text-xs font-semibold text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
-            >
-              <HardDriveDownload className="h-3.5 w-3.5" />
-              <span>从 QAQManager 一键导入</span>
             </button>
             <button
               type="button"
@@ -553,6 +631,7 @@ export function CharactersView() {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
+            aria-label="搜索角色"
             placeholder="搜索角色 / 拼音 / 首字母 / 别名（如 pq、admin）..."
             className="glass-surface w-full rounded-xl py-2 pr-8 pl-9 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
           />
@@ -560,6 +639,7 @@ export function CharactersView() {
             <button
               type="button"
               onClick={() => setSearchQuery("")}
+              aria-label="清空搜索"
               className="absolute top-1/2 right-2.5 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text-primary)]"
             >
               <X className="h-3.5 w-3.5" />
@@ -571,7 +651,7 @@ export function CharactersView() {
           <button
             type="button"
             onClick={() => openImportWizard([], null)}
-            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)]"
+            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent-fill)] px-3 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)]"
           >
             <Archive className="h-3.5 w-3.5" />
             <span>导入 Mod</span>
@@ -593,19 +673,6 @@ export function CharactersView() {
           >
             <Wrench className="h-3.5 w-3.5" />
             <span>全库修复</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => updateConfigPatch({ showAllCharacters: !showAll })}
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
-              showAll
-                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                : "glass-surface text-[var(--text-primary)] hover:border-[var(--border-strong)]"
-            }`}
-          >
-            {showAll ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-            <span>{showAll ? "显示全部干员" : "仅看已有 Mod"}</span>
           </button>
 
           <button
@@ -633,18 +700,70 @@ export function CharactersView() {
         </div>
       </div>
 
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-5 pb-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <div
+            role="group"
+            aria-label="角色显示范围"
+            className="glass-surface inline-flex items-center gap-0.5 rounded-xl p-0.5"
+          >
+            <button
+              type="button"
+              aria-pressed={!showAll}
+              disabled={Boolean(movingMod)}
+              onClick={() => void handleShowAllChange(false)}
+              className={`${characterControlClass} disabled:cursor-default disabled:opacity-60`}
+            >
+              有内容
+            </button>
+            <button
+              type="button"
+              aria-pressed={showAll}
+              disabled={Boolean(movingMod)}
+              onClick={() => void handleShowAllChange(true)}
+              className={`${characterControlClass} disabled:cursor-default`}
+            >
+              全部角色
+            </button>
+          </div>
+
+          <div
+            role="group"
+            aria-label="角色排序"
+            className="glass-surface inline-flex items-center gap-0.5 rounded-xl p-0.5"
+          >
+            {CHARACTER_SORT_OPTIONS.map(({ value, label }) => (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={sortMode === value}
+                onClick={() => handleSortChange(value)}
+                className={characterControlClass}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div role="status" className="text-xs tabular-nums text-[var(--text-muted)]">
+          {loading && characters.length === 0
+            ? "正在加载角色分类…"
+            : `分类 ${visibleCharacters.length}/${characters.length} · Mod ${visibleModCount}/${totalModCount}`}
+        </div>
+      </div>
+
       {/* Grid */}
       <div className="flex-1 overflow-y-auto px-5 pb-6">
-        {visibleCharacters.length === 0 ? (
+        {loading && characters.length === 0 ? null : visibleCharacters.length === 0 ? (
           <div className="glass-card mx-auto mt-10 max-w-md rounded-2xl p-6 text-center">
             <UserPlus className="mx-auto h-8 w-8 text-[var(--text-muted)]" />
             <div className="mt-3 text-sm font-semibold text-[var(--text-primary)]">
-              {searchQuery ? "没有匹配的角色分类" : "当前没有包含 Mod 的角色目录"}
+              {normalizedQuery ? "没有匹配的角色分类" : "当前没有可显示的角色分类"}
             </div>
             <p className="mt-1 text-xs text-[var(--text-secondary)]">
-              {searchQuery
-                ? "请尝试更换关键词或清除搜索过滤。"
-                : "可点击上方「显示全部干员」查看预设角色表，或在目录中新增角色文件夹。"}
+              {normalizedQuery
+                ? "试试其他关键词，或切换到「全部角色」。"
+                : "切换到「全部角色」查看预设角色，或新增角色分类。"}
             </p>
           </div>
         ) : (
@@ -654,7 +773,7 @@ export function CharactersView() {
             onDragEnd={handleDragEnd}
           >
             <SortableContext
-              items={visibleCharacters.map((c) => c.name)}
+              items={reorderableCharacters.map((item) => item.name)}
               strategy={rectSortingStrategy}
             >
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
@@ -662,7 +781,9 @@ export function CharactersView() {
                   <SortableCharacterCard
                     key={item.name}
                     item={item}
-                    dndEnabled={dndEnabled}
+                    canDropCover={item.existsOnDisk && !movingMod}
+                    coverDropActive={coverDropTarget === item.name}
+                    dndEnabled={dndEnabled && !item.pinned}
                     isMoveTarget={
                       Boolean(movingMod) && movingMod?.sourceCharacter !== item.name
                     }
@@ -698,7 +819,7 @@ export function CharactersView() {
               type="button"
               onClick={handleCreateCharacter}
               disabled={addSaving}
-              className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
             >
               {addSaving ? "创建中..." : "创建分类"}
             </button>
@@ -768,9 +889,12 @@ export function CharactersView() {
         title={`更换封面：${coverTarget?.name ?? ""}`}
         aspect={303 / 386}
         initialImageUrl={
-          coverTarget ? buildMediaUrl(coverTarget.coverPath, coverTarget.coverMtime) : null
+          coverSource ?? (coverTarget ? buildMediaUrl(coverTarget.coverPath, coverTarget.coverMtime) : null)
         }
-        onClose={() => setCoverTarget(null)}
+        onClose={() => {
+          setCoverTarget(null);
+          setCoverSource(null);
+        }}
         onConfirm={async (dataUrl) => {
           if (!coverTarget) return;
           await api.setCharacterCoverData(coverTarget.name, dataUrl);
@@ -799,7 +923,7 @@ export function CharactersView() {
               type="button"
               onClick={handleRenameConfirm}
               disabled={renaming}
-              className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-hover)] disabled:opacity-50"
+              className="rounded-xl bg-[var(--accent-fill)] px-4 py-2 text-xs font-semibold text-[var(--accent-contrast)] hover:bg-[var(--accent-fill-hover)] disabled:opacity-50"
             >
               {renaming ? "保存中..." : "确认重命名"}
             </button>
@@ -884,7 +1008,7 @@ export function CharactersView() {
         <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
           此操作会恢复
           <strong className="mx-1 text-[var(--text-primary)]">「{resetIniTarget?.name}」</strong>
-          下所有 Mod 的 `.qaqm-persistbak` 备份、清理 `d3dx_user.ini` 与 Persist Bridge 状态缓存。您修改过的本地快捷键如已同步过仍会保留。
+          下所有 Mod 的 EFMM INI 备份，并清理对应的 EFMM 持久化缓存。本地快捷键修改会保留。
         </p>
       </Modal>
     </div>

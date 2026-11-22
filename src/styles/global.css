@@ -100,7 +100,7 @@ select:focus-visible {
 @keyframes focusPulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(236, 72, 153, 0);
+    box-shadow: 0 0 0 0 transparent;
   }
   45% {
     box-shadow: 0 0 0 4px var(--accent-soft);
@@ -109,4 +109,57 @@ select:focus-visible {
 
 .focus-pulse {
   animation: focusPulse 1.4s ease-in-out 2;
+}
+
+.mod-workspace {
+  container-type: inline-size;
+}
+
+.mod-workspace > section,
+.mod-detail-pane {
+  background-color: var(--bg-surface-strong);
+}
+
+.mod-detail-reveal {
+  --mod-detail-width: clamp(280px, var(--mod-detail-share), min(850px, calc(100cqw - 340px)));
+  --mod-detail-reveal-width: calc(var(--mod-detail-width) + 24px);
+  flex: none;
+  width: 0;
+  overflow: clip;
+  transition: width 250ms cubic-bezier(.22, .72, .24, 1);
+}
+
+.mod-detail-reveal[data-open="true"],
+.mod-detail-inner {
+  width: var(--mod-detail-reveal-width);
+}
+
+.mod-detail-inner {
+  opacity: 0;
+  transform: translateX(10px);
+  transition: opacity 180ms ease, transform 230ms ease;
+}
+
+.mod-detail-reveal[data-open="true"] > .mod-detail-inner {
+  opacity: 1;
+  transform: none;
+}
+
+.mod-detail-reveal[data-resizing="true"] {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mod-detail-reveal,
+  .mod-detail-inner {
+    transition: none;
+  }
+}
+
+.mod-gallery {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 205px), 1fr));
+}
+
+.mod-detail-preview {
+  height: clamp(180px, 47vh, 468px);
 }

@@ -320,7 +320,10 @@ fn count_mods_in_char_dir(char_dir: &Path) -> (usize, usize) {
     (total, enabled)
 }
 
-pub fn list_characters(cfg: &AppConfig) -> Result<Vec<CharacterItem>, String> {
+pub fn list_characters(
+    cfg: &AppConfig,
+    include_all: Option<bool>,
+) -> Result<Vec<CharacterItem>, String> {
     let mods_root = Path::new(&cfg.mods_path);
     let has_mods_root = !cfg.mods_path.trim().is_empty() && mods_root.is_dir();
 
@@ -366,7 +369,7 @@ pub fn list_characters(cfg: &AppConfig) -> Result<Vec<CharacterItem>, String> {
         }
     }
 
-    if cfg.show_all_characters {
+    if include_all.unwrap_or(cfg.show_all_characters) {
         for def_name in default_character_names() {
             if !items_map.contains_key(def_name) {
                 let virtual_path = if has_mods_root {
@@ -537,6 +540,19 @@ pub fn rename_character(cfg: &mut AppConfig, old_name: &str, new_name: &str) -> 
     if let Some(v) = cfg.exclusive_by_category.remove(&old_safe) {
         cfg.exclusive_by_category.insert(new_safe.clone(), v);
     }
+    let old_prefix = format!("{old_safe}/");
+    let renamed_added: Vec<(String, i64)> = cfg
+        .mod_added_at
+        .iter()
+        .filter(|(k, _)| k.starts_with(&old_prefix))
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
+    for (old_key, ms) in renamed_added {
+        cfg.mod_added_at.remove(&old_key);
+        let suffix = &old_key[old_prefix.len()..];
+        cfg.mod_added_at
+            .insert(format!("{new_safe}/{suffix}"), ms);
+    }
     save_config(cfg)?;
 
     if let Ok(mut presets) = load_presets() {
@@ -565,6 +581,9 @@ pub fn delete_character(cfg: &mut AppConfig, char_name: &str) -> Result<(), Stri
     cfg.pinned_mods.remove(char_name);
     cfg.mod_orders.remove(char_name);
     cfg.character_sections.remove(char_name);
+    cfg.exclusive_by_category.remove(char_name);
+    let prefix = format!("{char_name}/");
+    cfg.mod_added_at.retain(|k, _| !k.starts_with(&prefix));
     save_config(cfg)?;
     Ok(())
 }
@@ -598,8 +617,8 @@ pub fn set_character_cover_file(
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
-        .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif"))
-        .ok_or_else(|| "仅支持 PNG、JPG、WebP 或 GIF 图片格式".to_string())?;
+        .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"))
+        .ok_or_else(|| "仅支持 PNG、JPG、WebP、GIF 或 BMP 图片格式".to_string())?;
     let dir = resolve_character_dir(cfg, char_name)?;
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("创建角色目录失败：{e}"))?;

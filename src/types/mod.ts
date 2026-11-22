@@ -49,6 +49,10 @@ export interface AppConfig {
   persistBridgeCacheSize: number;
   persistBridgeRecent: string[];
   customFixerPath: string;
+  updateRepo: string;
+  updateMirrorPrefix: string;
+  updateGithubToken: string;
+  autoCheckUpdates: boolean;
 }
 
 export interface CharacterItem {
@@ -176,13 +180,6 @@ export interface AutoDetectedPaths {
   xxmiPath: string | null;
 }
 
-export interface QaqmImportSummary {
-  importedPaths: boolean;
-  importedOrderCount: number;
-  importedPresetCount: number;
-  warnings: string[];
-}
-
 export interface TagPoolItem {
   id: string;
   name: string;
@@ -195,6 +192,7 @@ export interface TagsPoolStore {
 
 export interface PersistBridgeStatus {
   enabled: boolean;
+  legacyConflict: boolean;
   cacheSize: number;
   d3dxMounted: boolean;
   activeStateCount: number;
@@ -311,6 +309,7 @@ export interface ImportAnalyzedItem {
   suggestedCharacter: string | null;
   matchConfidence: string;
   suggestedModName: string;
+  installDisabled: boolean;
   isEffMod: boolean;
   isDisguisedMp4: boolean;
   isLargeArchive: boolean;
@@ -422,5 +421,29 @@ export interface PackageUpdateResult {
   targetKind: string;
   copiedFiles: number;
   skippedProtectedPaths: string[];
+  message: string;
+}
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  canAutoUpdate: boolean;
+  minSupportedClientVersion: string;
+  pubDate: string;
+  notes: string;
+  releaseUrl: string;
+  downloadUrl: string;
+  fileName: string;
+  fileSize: number;
+  sha256: string;
+  source: string;
+}
+
+export interface UpdateProgressEvent {
+  stage: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  percent: number;
   message: string;
 }

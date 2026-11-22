@@ -50,7 +50,7 @@ pub fn has_persist_backup(mod_dir: &Path) -> bool {
                 && e.file_name()
                     .to_string_lossy()
                     .to_ascii_lowercase()
-                    .ends_with(".qaqm-persistbak")
+                    .ends_with(crate::persist_bridge::BACKUP_SUFFIX)
         })
 }
 
@@ -675,15 +675,8 @@ pub fn update_hotkey_in_ini(
         return Err(format!("未在 {} 中找到区块 [{}]", clean_rel, section));
     }
 
-    // Keep .qaqm-persistbak synchronized so disabling Persist Bridge won't revert user's edited key
-    let bak_name = format!(
-        "{}.qaqm-persistbak",
-        target_ini
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mod.ini")
-    );
-    let bak_path = target_ini.with_file_name(bak_name);
+    // A local shortcut edit is kept when our own bridge later restores the INI.
+    let bak_path = crate::persist_bridge::backup_path(&target_ini);
     if bak_path.is_file() {
         let _ = patch_single_ini_hotkey(&bak_path, section, expr);
     }

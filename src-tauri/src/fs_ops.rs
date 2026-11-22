@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::http::{Request, Response, StatusCode};
 
 const RETRY_DELAYS_MS: [u64; 8] = [120, 220, 350, 500, 800, 1200, 1600, 2200];
@@ -35,6 +35,35 @@ fn is_retryable_rename_err(err: &std::io::Error) -> bool {
 }
 
 pub fn rename_dir_with_retry(src: &Path, dst: &Path) -> Result<(), String> {
+    if src == dst {
+        return Ok(());
+    }
+    let same_parent_case_only = src.parent() == dst.parent()
+        && match (
+            src.file_name().and_then(|s| s.to_str()),
+            dst.file_name().and_then(|s| s.to_str()),
+        ) {
+            (Some(a), Some(b)) => a != b && a.eq_ignore_ascii_case(b),
+            _ => false,
+        };
+    if same_parent_case_only {
+        let parent = src.parent().ok_or_else(|| "无效路径".to_string())?;
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp = parent.join(format!(".efmm_case_tmp_{ts}"));
+        rename_dir_with_retry_inner(src, &temp)?;
+        if let Err(err) = rename_dir_with_retry_inner(&temp, dst) {
+            let _ = rename_dir_with_retry_inner(&temp, src);
+            return Err(err);
+        }
+        return Ok(());
+    }
+    rename_dir_with_retry_inner(src, dst)
+}
+
+fn rename_dir_with_retry_inner(src: &Path, dst: &Path) -> Result<(), String> {
     if src == dst {
         return Ok(());
     }
@@ -103,7 +132,7 @@ pub fn file_mtime_ms(path: &Path) -> u64 {
 }
 
 pub fn find_image_in_dir(dir: &Path, stem: &str) -> Option<(PathBuf, u64)> {
-    const EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+    const EXTS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "gif", "bmp"];
     for ext in EXTS {
         let candidate = dir.join(format!("{stem}.{ext}"));
         if candidate.is_file() {
